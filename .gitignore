@@ -40,6 +40,7 @@ tests/tmp-*
 # System files
 *.pid
 *.lock
+!flake.lock
 
 # Local AI Assistant Instructions
 # CLAUDE.md is a symlink to AGENTS.md (shared source of truth, tracked).
