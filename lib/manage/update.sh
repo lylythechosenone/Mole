@@ -701,6 +701,48 @@ is_homebrew_install() {
     is_homebrew_mole_path "$mole_path" "$has_brew"
 }
 
+is_nix_mole_path() {
+    local mole_path="$1"
+    local store_dir="${NIX_STORE_DIR:-${NIX_STORE:-/nix/store}}"
+    store_dir="${store_dir%/}"
+    [[ -n "$mole_path" ]] || return 1
+
+    if [[ "$mole_path" == *"$store_dir/"* || "$mole_path" == *"/nix/store/"* ]]; then
+        return 0
+    fi
+
+    local target="$mole_path"
+    local hops=0
+    while [[ -L "$target" && $hops -lt 16 ]]; do
+        hops=$((hops + 1))
+        local dir
+        dir="$(dirname "$target")"
+        target="$(readlink "$target" 2> /dev/null || true)"
+        [[ "$target" != /* ]] && target="$dir/$target"
+        if [[ "$target" == *"$store_dir/"* || "$target" == *"/nix/store/"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Install detection (Nix).
+is_nix_install() {
+    [[ "${MOLE_NIX_INSTALL:-0}" == "1" ]] && return 0
+
+    local store_dir="${NIX_STORE_DIR:-${NIX_STORE:-/nix/store}}"
+    store_dir="${store_dir%/}"
+    if [[ "${SCRIPT_DIR:-}" == *"$store_dir/"* || "${SCRIPT_DIR:-}" == *"/nix/store/"* ||
+        "${SCRIPT_PATH:-}" == *"$store_dir/"* || "${SCRIPT_PATH:-}" == *"/nix/store/"* ]]; then
+        return 0
+    fi
+
+    local mole_path
+    mole_path=$(resolve_mole_source_path || true)
+    is_nix_mole_path "$mole_path"
+}
+
 get_install_channel() {
     # This install's own receipt wins. install.sh --config can move the config
     # dir, and the launcher records where it went in SCRIPT_DIR, so reading the
@@ -850,6 +892,10 @@ _mole_write_update_cache() {
 # Bind the throttle to the install version, channel, commit and entrypoint.
 check_for_updates() {
     local cache_dir="$HOME/.cache/mole" channel key now saved_key="" checked=0 interval=0
+    if is_nix_install; then
+        [[ -f "$cache_dir/update_message" ]] && : > "$cache_dir/update_message" 2> /dev/null || true
+        return 0
+    fi
     ensure_user_dir "$cache_dir" || return 0
     channel=$(get_install_channel)
     key=$(printf '%s\n' "$VERSION" "$channel" "$(get_install_commit)" "${MOLE_ENTRY_SCRIPT:-${SCRIPT_DIR:-}}" | cksum | awk '{print $1}')
@@ -971,7 +1017,9 @@ show_version() {
     disk_free=$(get_free_space)
 
     local install_method="Manual"
-    if is_homebrew_install; then
+    if is_nix_install; then
+        install_method="Nix"
+    elif is_homebrew_install; then
         install_method="Homebrew"
     fi
 
@@ -1057,6 +1105,13 @@ update_mole() (
     }
     trap '_update_cleanup; update_interrupted=true; echo ""; exit 130' INT TERM
     trap '_update_cleanup' EXIT
+
+    if is_nix_install; then
+        local review_icon="${ICON_REVIEW:-⊙}"
+        log_error "Mole was installed via Nix. Self-update is disabled."
+        printf '%s To update Mole: nix profile upgrade mole, nix flake update, or update your Nix configuration\n' "$review_icon"
+        exit 1
+    fi
 
     if is_homebrew_install; then
         if [[ "$nightly_update" == "true" ]]; then

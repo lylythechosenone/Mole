@@ -3801,6 +3801,25 @@ EOF
     [[ "$output" != *"$fake_global_bin/mo"* ]] || return 1
     [[ "$output" != *"brew uninstall --force mole"* ]]
 }
+
+@test "remove_mole disables itself for Nix installations" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_NIX_INSTALL=1 \
+        "$PROJECT_ROOT/mole" remove
+
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Mole was installed via Nix. Self-removal is disabled."* ]] || return 1
+    [[ "$output" == *"nix profile remove mole"* ]]
+}
+
+@test "remove_mole dry-run disables itself for Nix installations" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_NIX_INSTALL=1 \
+        "$PROJECT_ROOT/mole" remove --dry-run
+
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"Mole was installed via Nix. Self-removal is disabled."* ]] || return 1
+    [[ "$output" == *"nix profile remove mole"* ]]
+}
+
 @test "match_apps_by_name finds exact match case-insensitively" {
     run /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail

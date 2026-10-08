@@ -2071,3 +2071,58 @@ curl() { echo '{"tag_name":"V1.59.1"}'; }
 SCRIPT
  [ "$status" -eq 0 ]
 }
+
+@test "mo update disables itself for Nix installations" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_NIX_INSTALL=1 \
+		/bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+SCRIPT_DIR="$PROJECT_ROOT"
+source "$PROJECT_ROOT/lib/core/common.sh" > /dev/null 2>&1
+source "$PROJECT_ROOT/lib/manage/update.sh" > /dev/null 2>&1
+update_mole
+INNER
+
+	[ "$status" -eq 1 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Mole was installed via Nix. Self-update is disabled."* ]] || return 1
+	[[ "$output" == *"nix profile upgrade mole"* ]]
+}
+
+@test "is_nix_install recognizes nix store paths" {
+	local fake_store="$TEST_ROOT/nix/store/1234567890abcdef-mole-1.58.0/share/mole"
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" FAKE_STORE="$fake_store" \
+		/bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+SCRIPT_DIR="$FAKE_STORE"
+source "$PROJECT_ROOT/lib/core/common.sh" > /dev/null 2>&1
+source "$PROJECT_ROOT/lib/manage/update.sh" > /dev/null 2>&1
+is_nix_install && echo "NIX_DETECTED"
+INNER
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"NIX_DETECTED"* ]]
+}
+
+@test "check_for_updates skips update notification for Nix installations" {
+	mkdir -p "$HOME/.cache/mole"
+	echo "Stale update message" > "$HOME/.cache/mole/update_message"
+
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_NIX_INSTALL=1 \
+		/bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+SCRIPT_DIR="$PROJECT_ROOT"
+source "$PROJECT_ROOT/lib/core/common.sh" > /dev/null 2>&1
+source "$PROJECT_ROOT/lib/manage/update.sh" > /dev/null 2>&1
+check_for_updates
+INNER
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[ ! -s "$HOME/.cache/mole/update_message" ]
+}
+
+@test "mole --version reports Nix install method for Nix installations" {
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_NIX_INSTALL=1 \
+		"$PROJECT_ROOT/mole" --version
+
+	[ "$status" -eq 0 ] || { echo "$output"; return 1; }
+	[[ "$output" == *"Install: Nix"* ]]
+}

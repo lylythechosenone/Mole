@@ -47,6 +47,20 @@ _remove_config_dir() {
 # Remove flow (Homebrew + manual + config/cache).
 remove_mole() {
     local dry_run_mode="${1:-false}"
+    local is_nix=false
+    if declare -f is_nix_install > /dev/null 2>&1; then
+        is_nix_install && is_nix=true
+    elif [[ "${MOLE_NIX_INSTALL:-0}" == "1" || "${SCRIPT_DIR:-}" == *"/nix/store/"* || "${SCRIPT_PATH:-}" == *"/nix/store/"* ]]; then
+        is_nix=true
+    fi
+
+    if [[ "$is_nix" == "true" ]]; then
+        local review_icon="${ICON_REVIEW:-⊙}"
+        log_error "Mole was installed via Nix. Self-removal is disabled."
+        printf '%s To remove Mole: nix profile remove mole or remove from your Nix configuration\n' "$review_icon"
+        exit 1
+    fi
+
     local remove_config_dir
     local test_mode=false
     if [[ "${MOLE_TEST_MODE:-0}" == "1" ]]; then
