@@ -215,8 +215,8 @@ run_with_timeout() {
     esac
 }
 load_purge_config
-[[ $PURGE_DISCOVERY_STATUS -eq 124 ]]
-[[ "${PURGE_SEARCH_PATHS[*]}" == *"$HOME/Alpha"* ]]
+[[ $PURGE_DISCOVERY_STATUS -eq 124 ]] || exit 1
+[[ "${PURGE_SEARCH_PATHS[*]}" == *"$HOME/Alpha"* ]] || exit 1
 [[ ! -e "$PURGE_CONFIG_FILE" ]]
 EOF
     [ "$status" -eq 0 ] || return 1

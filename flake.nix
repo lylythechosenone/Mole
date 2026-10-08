@@ -19,9 +19,13 @@
           pkgs = pkgsFor system;
         in
         {
-          mole = pkgs.buildGoModule {
+          mole = pkgs.buildGo126Module {
             pname = "mole";
-            version = "1.58.0";
+            version = let
+              line = pkgs.lib.findFirst (pkgs.lib.hasPrefix "VERSION=")
+                (throw "mole VERSION assignment not found")
+                (pkgs.lib.splitString "\n" (builtins.readFile ./mole));
+            in builtins.head (builtins.match ''VERSION="([^"]+)"'' line);
             src = ./.;
 
             vendorHash = "sha256-TzaadXDCwwu+KBI5Pj/u6hMWKssvyb7zGZYSbkuqT3U=";
@@ -29,6 +33,9 @@
             subPackages = [ "cmd/analyze" "cmd/status" ];
             ldflags = [ "-s" "-w" ];
             doCheck = false;
+            env.CGO_ENABLED = "0";
+            # Mole depends on macOS Bash 3.2 and BSD tools at runtime.
+            dontPatchShebangs = true;
 
             postInstall = ''
               mkdir -p $out/share/mole/bin $out/share/mole/lib
@@ -86,7 +93,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               # Go toolchain and linters
-              go
+              go_1_26
               golangci-lint
               gotools # provides goimports
 

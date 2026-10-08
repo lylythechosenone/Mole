@@ -142,6 +142,17 @@ _main_menu_controls_line() {
     printf '%s' "$controls"
 }
 
+# Render-time look of the cached update notice: a blank line above and the
+# command in green. The cache and the after-command line stay plain text.
+_main_menu_update_notice() {
+    local message="$1"
+    case "$message" in
+        *"mo update --nightly") message="${message%mo update --nightly}${GREEN}mo update --nightly${NC}" ;;
+        *"mo update") message="${message%mo update}${GREEN}mo update${NC}" ;;
+    esac
+    printf '\n%s' "$message"
+}
+
 # Menu UI
 show_main_menu() {
     local selected="${1:-1}"
@@ -164,6 +175,7 @@ show_main_menu() {
     done <<< "$banner"
 
     if [[ -n "$update_message" ]]; then
+        update_message="$(_main_menu_update_notice "$update_message")"
         while IFS= read -r line || [[ -n "$line" ]]; do
             printf '\r\033[2K%s\n' "$line"
         done <<< "$update_message"

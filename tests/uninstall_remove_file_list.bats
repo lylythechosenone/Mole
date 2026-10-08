@@ -832,3 +832,36 @@ EOF
     done
     [ "$failures" -eq 0 ]
 }
+
+@test "remove_file_list keeps leftovers when the app returns, whatever the plan's bundle id" {
+    # The replacement test needs no inventory, so a plan narrowed to an
+    # unknown id, or an id that is not reverse-DNS, must keep name-keyed data
+    # exactly like an ordinary plan does.
+    local id
+    for id in unknown com.example.Target_Beta com.example.Target; do
+        rm -rf "$HOME/Applications" "$HOME/Library" "$HOME/moved-Target.app"
+        mkdir -p "$HOME/Applications/Target.app/Contents" "$HOME/Library/Application Support/Target"
+        printf 'notes\n' > "$HOME/Library/Application Support/Target/notes"
+        run env PROJECT_ROOT="$PROJECT_ROOT" BUNDLE_ID="$id" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+source "$PROJECT_ROOT/tests/helpers/uninstall.bash"
+mole_test_isolate_uninstall_inventory
+app="$HOME/Applications/Target.app"
+data="$HOME/Library/Application Support/Target"
+mv "$app" "$HOME/moved-Target.app"
+mkdir -p "$app/Contents"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 16 && "$count" == 0 ]] || { echo "reappeared rc=$rc count=$count"; exit 1; }
+[[ -f "$data/notes" ]] || { echo "data removed while the app path was occupied"; exit 1; }
+# Positive control: with the path free, the same call reaches the sink.
+rm -rf "$app"
+rc=0
+count=$(remove_file_list "$data" false "$BUNDLE_ID" "$app") || rc=$?
+[[ $rc -eq 0 && "$count" == 1 && ! -e "$data" ]] || { echo "control rc=$rc count=$count"; exit 1; }
+EOF
+        [ "$status" -eq 0 ] || { echo "bundle id $id: $output"; return 1; }
+    done
+}

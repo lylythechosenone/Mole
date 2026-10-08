@@ -95,7 +95,9 @@ def check_notice(script, expected_status=0, wait_marker=None, keys=b'', required
         sent = False
         repeated = False
         try:
-            deadline = time.monotonic() + 10
+            # Only hang detection: a loaded machine can delay sourcing mole and
+            # the one-second child cleanup well past ten seconds.
+            deadline = time.monotonic() + 30
             while b'CASE_EXIT=' not in output:
                 assert time.monotonic() < deadline, ('terminal case timed out', output[-3000:])
                 if select.select([master], [], [], .02)[0]:
@@ -152,12 +154,16 @@ main {command}
     assert output.index(b'COMMAND_DONE') < output.index(b'Update 9.8.7 available'), output
 print('PASS: all seven interactive subcommands retain their status and show the notice after completion')
 
-for flag in ['--json', '-json', '--json=true', '--watch', '-watch', '--help', '--list']:
+for flag in ['--json', '-json', '--json=true', '-json=true', '--ndjson', '--watch', '-watch', '--watch=true',
+             '-watch=true', '--help', '-h', '--version', '-V', '--list', '--list=x']:
     check_notice(setup + f'''run_mole_command /bin/bash -c 'printf "JSON_OUTPUT\\n"' test {flag}''',
                  required=(b'JSON_OUTPUT',), forbidden=(b'CHECK_CALLED', b'Update 9.8.7'))
-check_notice(setup + '''run_mole_command /bin/bash -c 'exit 0' > "$HOME/output"''',
-             forbidden=(b'CHECK_CALLED', b'Update 9.8.7'))
-print('PASS: machine-readable flags, help, lists and redirected output stay silent')
+# Each of the three standard streams alone is enough to skip the notice. The
+# all-terminal runs above are the positive control for CHECK_CALLED.
+for redirect in ['> "$HOME/output"', '< /dev/null', '2> "$HOME/errors"']:
+    check_notice(setup + f"""run_mole_command /bin/bash -c 'exit 0' {redirect}""",
+                 forbidden=(b'CHECK_CALLED', b'Update 9.8.7'))
+print('PASS: machine-readable flags, help, lists and any redirected stream stay silent')
 
 check_notice(setup + '''run_mole_command /bin/bash -c 'trap "exit 130" INT; echo CHILD_READY; while :; do :; done' ''',
              expected_status=130, wait_marker=b'CHILD_READY', keys=b'\x03',
@@ -173,12 +179,15 @@ check_notice(setup + '''run_mole_command /bin/bash -c 'echo READ_READY; IFS= rea
              wait_marker=b'READ_READY', keys=b'hello\n', required=(b'GOT:hello',))
 print('PASS: interactive child keeps terminal stdin')
 
-for repeat in [signal.SIGTERM, signal.SIGINT]:
+# The first signal fixes the status, whichever trap sees it and whichever signal
+# follows; each pair would differ if one trap overwrote an earlier status.
+for first, repeat in [(signal.SIGTERM, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT), (signal.SIGTERM, signal.SIGHUP),
+                      (signal.SIGINT, signal.SIGTERM), (signal.SIGHUP, signal.SIGTERM)]:
     output = check_notice(setup + """
 cat > "$HOME/signal-child" <<'CHILD'
 #!/bin/bash
-cleanup() { trap '' TERM INT; echo CLEANUP_STARTED; sleep 1; echo CLEANUP_DONE; exit 0; }
-trap cleanup TERM
+cleanup() { trap '' TERM INT HUP; echo CLEANUP_STARTED; sleep 1; echo CLEANUP_DONE; exit 0; }
+trap cleanup TERM INT HUP
 echo CHILD_READY
 while :; do :; done
 CHILD
@@ -186,7 +195,70 @@ chmod +x "$HOME/signal-child"
 echo WRAPPER_PID=$$
 run_mole_command "$HOME/signal-child"
 """,
-                          expected_status=143, wait_marker=b'CHILD_READY', parent_signal=signal.SIGTERM,
+                          expected_status=128 + first, wait_marker=b'CHILD_READY', parent_signal=first,
                           repeat_signal=repeat, required=(b'CLEANUP_DONE',), forbidden=(b'Update 9.8.7',))
     assert output.index(b'CLEANUP_DONE') < output.index(b'CASE_EXIT='), output
 print('PASS: repeated signals preserve the first cancellation and wait for child cleanup')
+
+# A target bash cannot launch keeps the diagnostic and status that a plain exec
+# gives in the mole environment (the redirected-output path: 1, or 126 for a
+# directory), instead of the perl wrapper's silent 127.
+unlaunchable = setup + '''
+printf '#!/bin/bash\\nexit 0\\n' > "$HOME/plain.sh"
+chmod 644 "$HOME/plain.sh"
+mkdir "$HOME/adir"
+printf '#!/nonexistent/interp\\nexit 0\\n' > "$HOME/bad-interp.sh"
+chmod 755 "$HOME/bad-interp.sh"
+'''
+for target, message, status in [('nope.sh', b'No such file or directory', 1), ('plain.sh', b'Permission denied', 1),
+                                ('adir', b'is a directory', 126)]:
+    check_notice(unlaunchable + f'run_mole_command "$HOME/{target}"', expected_status=status,
+                 required=(message,), forbidden=(b'CHECK_CALLED', b'Update 9.8.7'))
+# A #! line naming a missing interpreter is caught before the wrapper spawns
+# anything, so bash names the interpreter ('bad interpreter') instead of the
+# wrapper blaming the script, and no update check starts.
+check_notice(unlaunchable + 'run_mole_command "$HOME/bad-interp.sh"', expected_status=1,
+             required=(b'bad interpreter',), forbidden=(b'CHECK_CALLED', b'Update 9.8.7'))
+print('PASS: an unlaunchable target keeps the diagnostic and status of a plain exec')
+
+# Without /usr/bin/perl the command still runs through the plain exec path and
+# only the notice is lost. The function text is rewritten to point at a missing
+# perl, because the real one cannot be removed for a test.
+check_notice(setup + """
+eval "$(declare -f run_mole_command | sed 's|/usr/bin/perl|/nonexistent/perl|g')"
+run_mole_command /bin/bash -c 'printf "COMMAND_DONE\\\\n"; exit 7'
+""", expected_status=7, required=(b'COMMAND_DONE',), forbidden=(b'nonexistent', b'Update 9.8.7'))
+print('PASS: a missing perl falls back to a plain exec with the command status')
+
+# A child killed by a signal must not surface bash's job-status line, which
+# quotes the internal perl one-liner; the status still reports the signal.
+check_notice(setup + '''run_mole_command /bin/bash -c 'echo CHILD_READY; kill -KILL $$' ''',
+             expected_status=137, required=(b'CHILD_READY',), forbidden=(b'perl', b'Killed', b'Update 9.8.7'))
+print('PASS: a child killed by a signal keeps its status without bash job-status text')
+
+# Delivery counts for INT. A terminal Ctrl-C reaches the child from the tty and
+# again from the router's forward, so one or two deliveries are expected there;
+# a signal sent to the router alone must arrive exactly once. The count child
+# keeps running after a delivery so a late duplicate is still counted.
+counter = setup + """
+cat > "$HOME/count-child" <<'CHILD'
+#!/bin/bash
+n=0
+trap 'n=$((n+1))' INT
+echo CHILD_READY
+end=$((SECONDS + 2))
+while ((SECONDS < end)); do :; done
+echo "INT_COUNT=$n"
+CHILD
+chmod +x "$HOME/count-child"
+echo WRAPPER_PID=$$
+run_mole_command "$HOME/count-child"
+"""
+output = check_notice(counter, expected_status=130, wait_marker=b'CHILD_READY', keys=b'\x03',
+                      forbidden=(b'Update 9.8.7',))
+count = re.search(rb'INT_COUNT=(\d+)', output)
+assert count and int(count.group(1)) in (1, 2), output
+output = check_notice(counter, expected_status=130, wait_marker=b'CHILD_READY', parent_signal=signal.SIGINT,
+                      forbidden=(b'Update 9.8.7',))
+assert b'INT_COUNT=1\r\n' in output, output
+print(f'PASS: INT reaches the child once from the router and at most twice from a terminal Ctrl-C (saw {int(count.group(1))})')

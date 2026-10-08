@@ -657,25 +657,37 @@ remove_file_list() {
     # Recheck at the leftover boundary, not only at preview or before moving
     # the app. A conflicting owner or incomplete inventory keeps the whole
     # data family; no name-derived row is strong enough to override it.
-    if [[ -n "$app_path" ]] && mole_is_reverse_dns_bundle_id "$bundle_id"; then
-        local owner_rc=0
-        local owner_reappeared=false
+    # A replacement at the selected path is a new owner too. That test needs
+    # no inventory, so it also covers plans narrowed to a bundle id that is
+    # unknown or not reverse-DNS; only the sibling scan needs the id.
+    # The cause is recorded per retained path so the summary can name it:
+    # app-reappeared, shared-owner (a live sibling), or owner-unknown (the
+    # inventory could not prove absence).
+    if [[ -n "$app_path" ]]; then
+        local owner_rc=1
+        local owner_reason=""
         if ! is_uninstall_dry_run && [[ -e "$app_path" || -L "$app_path" ]]; then
-            owner_rc=0 # A replacement at the selected path is a new owner too.
-            owner_reappeared=true
-        else
+            owner_rc=0
+            owner_reason="app-reappeared"
+        elif mole_is_reverse_dns_bundle_id "$bundle_id"; then
+            owner_rc=0
             uninstall_live_bundle_has_other_install "$bundle_id" "$app_path" || owner_rc=$?
+            [[ $owner_rc -ge 128 ]] && return "$owner_rc"
+            if [[ $owner_rc -eq 0 ]]; then
+                owner_reason="shared-owner"
+            elif [[ $owner_rc -ne 1 ]]; then
+                owner_reason="owner-unknown"
+            fi
         fi
-        [[ $owner_rc -ge 128 ]] && return "$owner_rc"
-        if [[ $owner_rc -ne 1 ]]; then
-            debug_log "Keeping uninstall leftovers: another owner exists or the installation inventory is incomplete"
+        if [[ -n "$owner_reason" ]]; then
+            debug_log "Keeping uninstall leftovers: $owner_reason"
             local retained_path
             while IFS= read -r retained_path; do
                 [[ -n "$retained_path" ]] || continue
-                if [[ "$owner_reappeared" == true ]]; then
+                if [[ "$owner_reason" == "app-reappeared" ]]; then
                     _mole_report_unverified_delete "$retained_path" "$mode" unknown "$MOLE_ERR_APP_REAPPEARED"
                 else
-                    _mole_record_uninstall_refusal "$retained_path" protected
+                    _mole_record_uninstall_refusal "$retained_path" "$owner_reason"
                 fi
             done <<< "$file_list"
             printf '0\n'
@@ -844,19 +856,25 @@ remove_file_list() {
 # differs only in case slip the guard, and the uninstall then wiped the data
 # both apps share.
 #
-# `LC_ALL=C tr` rather than `${var,,}`: this repo still supports bash 3.2.
+# `mole_ascii_lowercase` rather than `${var,,}`: this repo still supports bash
+# 3.2. It folds exactly the bytes `LC_ALL=C tr` did, without the fork that cost
+# a few milliseconds per candidate in the sibling scans.
 uninstall_normalize_bundle_id() {
-    printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+    local normalized
+    mole_ascii_lowercase normalized "$1"
+    printf '%s' "$normalized"
 }
 
 # The scanner claims dot-continuation IDs and channel-stripped app names.
 # Any independent installed bundle matching either form can still own those
 # rows. This is a retention predicate, never permission to claim new data.
+# Runs once per installed app in every sibling scan, so it stays fork-free and
+# takes ids in any case.
 uninstall_bundles_share_remnants() {
     local selected_id="$1" other_id="$2" selected_path="$3" other_path="$4"
     local selected_lower other_lower
-    selected_lower=$(uninstall_normalize_bundle_id "$selected_id")
-    other_lower=$(uninstall_normalize_bundle_id "$other_id")
+    mole_ascii_lowercase selected_lower "$selected_id"
+    mole_ascii_lowercase other_lower "$other_id"
     if [[ "$selected_lower" == "$other_lower" ||
         "$selected_lower" == "$other_lower."* || "$other_lower" == "$selected_lower."* ]]; then
         return 0
@@ -864,10 +882,12 @@ uninstall_bundles_share_remnants() {
     local selected_name="${selected_path##*/}" other_name="${other_path##*/}"
     selected_name="${selected_name%.[aA][pP][pP]}"
     other_name="${other_name%.[aA][pP][pP]}"
-    selected_name=$(uninstall_strip_version_suffix "$selected_name")
-    other_name=$(uninstall_strip_version_suffix "$other_name")
+    _uninstall_strip_version_suffix_into selected_name "$selected_name"
+    _uninstall_strip_version_suffix_into other_name "$other_name"
     [[ ${#selected_name} -ge 2 && ${#other_name} -ge 2 ]] || return 1
-    [[ "$(uninstall_normalize_bundle_id "$selected_name")" == "$(uninstall_normalize_bundle_id "$other_name")" ]]
+    mole_ascii_lowercase selected_name "$selected_name"
+    mole_ascii_lowercase other_name "$other_name"
+    [[ "$selected_name" == "$other_name" ]]
 }
 
 # A preview-time inventory cannot authorize bundle-id teardown: an app may be
@@ -1494,12 +1514,11 @@ uninstall_bundle_id_has_surviving_sibling() {
     local bundle_id_lower
     bundle_id_lower=$(uninstall_normalize_bundle_id "$bundle_id")
 
-    local row other_path other_bundle other_bundle_lower
+    local row other_path other_bundle
     # shellcheck disable=SC2154 # apps_data is provided by bin/uninstall.sh via dynamic scope.
     for row in "${apps_data[@]+"${apps_data[@]}"}"; do
         IFS='|' read -r _ other_path _ other_bundle _ _ _ <<< "$row"
-        other_bundle_lower=$(uninstall_normalize_bundle_id "$other_bundle")
-        uninstall_bundles_share_remnants "$bundle_id_lower" "$other_bundle_lower" "$app_path" "$other_path" || continue
+        uninstall_bundles_share_remnants "$bundle_id_lower" "$other_bundle" "$app_path" "$other_path" || continue
         [[ "$other_path" == "$app_path" ]] && continue
         [[ -d "$other_path" ]] || continue
 
@@ -1532,11 +1551,10 @@ uninstall_surviving_sibling_names() {
     local bundle_id_lower
     bundle_id_lower=$(uninstall_normalize_bundle_id "$bundle_id")
 
-    local row other_path other_name other_bundle other_bundle_lower
+    local row other_path other_name other_bundle
     for row in "${apps_data[@]+"${apps_data[@]}"}"; do
         IFS='|' read -r _ other_path other_name other_bundle _ _ _ <<< "$row"
-        other_bundle_lower=$(uninstall_normalize_bundle_id "$other_bundle")
-        uninstall_bundles_share_remnants "$bundle_id_lower" "$other_bundle_lower" "$app_path" "$other_path" || continue
+        uninstall_bundles_share_remnants "$bundle_id_lower" "$other_bundle" "$app_path" "$other_path" || continue
         [[ "$other_path" == "$app_path" ]] && continue
         [[ -d "$other_path" ]] || continue
 
@@ -1573,14 +1591,22 @@ uninstall_surviving_sibling_names() {
 # ("Zed Nightly" also matches "Zed" paths), so a collision check against the
 # survivor must consider the stripped form as well.
 uninstall_strip_version_suffix() {
-    local name="$1"
+    local stripped
+    _uninstall_strip_version_suffix_into stripped "$1"
+    printf '%s\n' "$stripped"
+}
+
+# Same strip, written into the variable named by $1 so a per-candidate caller
+# pays no command substitution. The match is case-sensitive on purpose, like
+# find_app_files; do not call it under nocasematch.
+_uninstall_strip_version_suffix_into() {
+    local _strip_value="$2"
     local version_suffixes="Nightly|Beta|Alpha|Dev|Canary|Preview|Insider|Edge|Stable|Release|RC|LTS"
     version_suffixes+="|Developer Edition|Technology Preview"
-    if [[ "$name" =~ ^(.+)[[:space:]]+(${version_suffixes})$ ]]; then
-        printf '%s\n' "${BASH_REMATCH[1]}"
-    else
-        printf '%s\n' "$name"
+    if [[ "$_strip_value" =~ ^(.+)[[:space:]]+(${version_suffixes})$ ]]; then
+        _strip_value="${BASH_REMATCH[1]}"
     fi
+    printf -v "$1" '%s' "$_strip_value"
 }
 
 # Internal helpers for batch_uninstall_applications. They read and write
@@ -2718,17 +2744,17 @@ _batch_execute_removals() {
             fi
 
             # Include retained ownership refusals from every removal pass once.
-            # Previews still explain every refusal, excluding expected survivors.
+            # A dry run applies the same reason filter as a real run: it never
+            # stops the app, so a live-cache refusal there describes a state
+            # the real run will not be in, and V1.58.0 never listed it.
             local refusal_path refusal_index
             for ((refusal_index = 0; refusal_index < ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]}; refusal_index++)); do
                 refusal_path="${_MOLE_UNINSTALL_REFUSAL_PATHS[$refusal_index]}"
-                if ! is_uninstall_dry_run; then
-                    case "${_MOLE_UNINSTALL_REFUSAL_REASONS[$refusal_index]}" in
-                        ownership-unverified | app-reappeared) ;;
-                        *) continue ;;
-                    esac
-                    [[ -e "$refusal_path" || -L "$refusal_path" ]] || continue
-                fi
+                case "${_MOLE_UNINSTALL_REFUSAL_REASONS[$refusal_index]}" in
+                    ownership-unverified | app-reappeared | shared-owner | owner-unknown) ;;
+                    *) continue ;;
+                esac
+                [[ -e "$refusal_path" || -L "$refusal_path" ]] || continue
                 if [[ ${#leftover_paths[@]} -eq 0 ]] ||
                     ! mole_identity_in_list "$refusal_path" "${leftover_paths[@]}"; then
                     leftover_paths+=("$refusal_path")
@@ -2737,6 +2763,9 @@ _batch_execute_removals() {
 
             # Warn about files that could not be removed and exclude them from freed total.
             if [[ ${#leftover_paths[@]} -gt 0 ]]; then
+                # A retained family shares one cause, so name it once instead
+                # of repeating it for every path of the family.
+                local family_kept_count=0 family_kept_label="" family_kept_first=""
                 for _lpath in "${leftover_paths[@]}"; do
                     local kept_reason=""
                     for ((refusal_index = 0; refusal_index < ${#_MOLE_UNINSTALL_REFUSAL_PATHS[@]}; refusal_index++)); do
@@ -2751,9 +2780,26 @@ _batch_execute_removals() {
                         access-denied) kept_label="macOS denied access" ;;
                         ownership-unverified) kept_label="Kept (agent ownership unverified; review the plist)" ;;
                         app-reappeared) kept_label="Kept (selected app path exists again; select the app again)" ;;
+                        shared-owner) kept_label="Kept (shared with another installed app)" ;;
+                        owner-unknown) kept_label="Kept (other copies of the app could not be checked)" ;;
+                    esac
+                    case "$kept_reason" in
+                        app-reappeared | shared-owner | owner-unknown)
+                            if [[ $family_kept_count -eq 0 || "$family_kept_label" == "$kept_label" ]]; then
+                                [[ $family_kept_count -gt 0 ]] || family_kept_first="$_lpath"
+                                family_kept_label="$kept_label"
+                                family_kept_count=$((family_kept_count + 1))
+                                continue
+                            fi
+                            ;;
                     esac
                     echo -e "  ${YELLOW}${ICON_WARNING}${NC} $kept_label: ${_lpath/#$HOME/$tilde_display}"
                 done
+                if [[ $family_kept_count -eq 1 ]]; then
+                    echo -e "  ${YELLOW}${ICON_WARNING}${NC} $family_kept_label: ${family_kept_first/#$HOME/$tilde_display}"
+                elif [[ $family_kept_count -gt 1 ]]; then
+                    echo -e "  ${YELLOW}${ICON_WARNING}${NC} $family_kept_label: $family_kept_count paths"
+                fi
                 total_kb=$((total_kb - leftover_kb))
                 ((total_kb < 0)) && total_kb=0
             fi

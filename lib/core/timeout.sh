@@ -80,6 +80,13 @@ mole_rc_timeout_or_signal() {
     [[ "${1:-0}" -eq 124 || "${1:-0}" -ge 128 ]]
 }
 
+# A mutating owner command may also exit with an errno-derived status such as
+# npm's 243, which is an ordinary failure. Only a status that names a real
+# signal means the user interrupted it; a timeout is not one.
+mole_rc_signal() {
+    [[ "${1:-0}" -ge 128 ]] && kill -l "$1" > /dev/null 2>&1
+}
+
 _mole_cleanup_timeout_killer() {
     local killer_pid="${1:-}"
     [[ "$killer_pid" =~ ^[0-9]+$ ]] || return 0

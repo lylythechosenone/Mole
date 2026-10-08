@@ -2668,6 +2668,82 @@ EOF
     done
 }
 
+@test "clean_dev_mobile stops when simctl delete unavailable is interrupted" {
+    # Ctrl-C while `simctl delete unavailable` holds the terminal reaches only
+    # the child. A signal stops cleanup before the recount and later caches;
+    # a plain failure or a timeout is a reported skip and cleanup continues.
+    local udid="ABCDEF01-2345-6789-ABCD-EF0123456789"
+    local delete_status case_home
+    for delete_status in 130 143 1 124; do
+        case_home="$HOME/simctl-delete-$delete_status"
+        mkdir -p "$case_home/Library/Developer/CoreSimulator/Devices/$udid"
+
+        run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+            MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 \
+            SIMCTL_CALL_LOG="$case_home/simctl-calls.log" DELETE_STATUS="$delete_status" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+check_android_ndk() { :; }
+clean_xcode_documentation_cache() { :; }
+clean_xcode_system_coresimulator_caches() { :; }
+clean_xcode_xctest_devices() { :; }
+clean_xcode_device_support() { echo "LATER_DEVICE_SUPPORT"; }
+safe_clean() { :; }
+get_path_size_kb() { echo "1"; }
+note_activity() { :; }
+debug_log() { :; }
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+cleanup_result_color_kb() { printf '%s' "$GREEN"; }
+xcrun() { :; }
+_resolve_simctl_developer_dir() {
+    _MOLE_SIMCTL_DEVELOPER_DIR="$HOME/Xcode.app/Contents/Developer"
+    _MOLE_SIMCTL_RESOLUTION_STATUS="ready"
+}
+_run_simctl() {
+    shift
+    printf '%s\n' "$*" >> "$SIMCTL_CALL_LOG"
+    case "$*" in
+        "list devices unavailable")
+            printf '    iPhone 12 (ABCDEF01-2345-6789-ABCD-EF0123456789) (Shutdown) (unavailable)\n'
+            return 0
+            ;;
+        "delete unavailable") return "$DELETE_STATUS" ;;
+    esac
+    return 1
+}
+
+rc=0
+clean_dev_mobile || rc=$?
+printf 'RC=%s CANCEL=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS"
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        local list_calls
+        list_calls=$(grep -c '^list devices unavailable$' "$case_home/simctl-calls.log" || true)
+        case "$delete_status" in
+            130 | 143)
+                [[ "$output" == *"RC=$delete_status CANCEL=$delete_status"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"cleanup failed"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                [ "$list_calls" -eq 1 ] || { echo "recount ran after an interrupted delete"; return 1; }
+                ;;
+            1)
+                [[ "$output" == *"RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Xcode unavailable simulators cleanup failed"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                ;;
+            124)
+                [[ "$output" == *"RC=0 CANCEL=0"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Xcode unavailable simulators · cleanup timed out"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"LATER_DEVICE_SUPPORT"* ]] || { echo "$output"; return 1; }
+                ;;
+        esac
+    done
+}
+
 @test "clean_dev_ai_agents protects the copilot version pointed at by ~/.local/bin/copilot" {
     local copilot_root="$HOME/.copilot/pkg/universal"
     local bin_dir="$HOME/.local/bin"

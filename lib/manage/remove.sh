@@ -11,9 +11,12 @@ readonly MOLE_MANAGE_REMOVE_LOADED=1
 
 # Read the shipped launcher signatures, never execute a discovered command.
 # Both main headers and common.sh locations are used by released Mole builds.
+# Read bytes, not characters: a non-ASCII config path pinned by a UTF-8 printf
+# %q is a raw lead byte plus \NNN escapes, and a UTF-8 awk rejects that record,
+# which would hide an installed launcher from removal.
 _remove_is_mole_launcher() {
     [[ -f "$1" ]] || return 1
-    /usr/bin/awk '
+    LC_ALL=C /usr/bin/awk '
         NR == 1 { bash = ($0 == "#!/bin/bash") }
         $0 == "# Mole - Main CLI entrypoint." || $0 == "# Mole - Main Entry Point" { main = 1 }
         /^VERSION=/ { version = 1 }
@@ -47,14 +50,8 @@ _remove_config_dir() {
 # Remove flow (Homebrew + manual + config/cache).
 remove_mole() {
     local dry_run_mode="${1:-false}"
-    local is_nix=false
-    if declare -f is_nix_install > /dev/null 2>&1; then
-        is_nix_install && is_nix=true
-    elif [[ "${MOLE_NIX_INSTALL:-0}" == "1" || "${SCRIPT_DIR:-}" == *"/nix/store/"* || "${SCRIPT_PATH:-}" == *"/nix/store/"* ]]; then
-        is_nix=true
-    fi
-
-    if [[ "$is_nix" == "true" ]]; then
+    # The router loads update.sh before remove.sh; isolated helper tests may not.
+    if declare -f is_nix_install > /dev/null 2>&1 && is_nix_install; then
         local review_icon="${ICON_REVIEW:-⊙}"
         log_error "Mole was installed via Nix. Self-removal is disabled."
         printf '%s To remove Mole: nix profile remove mole or remove from your Nix configuration\n' "$review_icon"

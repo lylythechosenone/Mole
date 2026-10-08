@@ -2017,58 +2017,70 @@ SCRIPT
 @test "safe_sudo_find_delete discards partial output when sudo find times out" {
     local target_dir="$TEST_DIR/sudo-find-partial-timeout-target"
     local mock_bin="$TEST_DIR/sudo-find-partial-timeout-bin"
-    local trace="$TEST_DIR/sudo-find-partial-timeout.trace"
-    mkdir -p "$target_dir" "$mock_bin"
+    local trace_dir="$TEST_DIR/sudo-find-partial-timeout-trace"
+    mkdir -p "$target_dir" "$mock_bin" "$trace_dir"
     touch "$target_dir/old.log"
 
+    # The sudo shell function below answers every call. A real sudo stays
+    # unreachable: anything that slips past it to PATH lands here and fails.
     cat > "$mock_bin/sudo" <<'MOCK'
 #!/bin/bash
-set -u
-printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE"
-[[ "${1:-}" == "-n" ]] && shift
-case "${1:-}" in
-    test)
-        shift
-        /bin/test "$@"
-        ;;
-    true)
-        exit 0
-        ;;
-    find)
-        printf '%s\0' "$TARGET_DIR/old.log"
-        exec sleep 4
-        ;;
-    xargs | rm)
-        printf 'UNEXPECTED_DELETE:%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE"
-        exit 99
-        ;;
-    *)
-        exit 99
-        ;;
-esac
+printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE_DIR/real-sudo"
+exit 99
 MOCK
     chmod +x "$mock_bin/sudo"
 
+    # Like safe_find_delete's partial-scan case: the stub leaves what the
+    # bounded wrapper leaves on expiry (the printed prefix, then status 124)
+    # instead of racing a mock's startup against a one-second budget. The
+    # second pass is the positive control: a completed scan must reach the
+    # privileged delete batch.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" \
-        PATH="$mock_bin:$PATH" MOLE_SUDO_FIND_TRACE="$trace" \
-        MOLE_TIMEOUT_DISK_VERIFY_SEC=1 MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 \
-        /bin/bash --noprofile --norc <<'SCRIPT'
+        PATH="$mock_bin:$PATH" MOLE_SUDO_FIND_TRACE_DIR="$trace_dir" \
+        MOLE_TEST_MODE=0 MOLE_TEST_NO_AUTH=0 MO_NO_OPLOG=1 /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-rc=0
-safe_sudo_find_delete "$TARGET_DIR" "*.log" "0" "f" "1" || rc=$?
-printf 'RC=%s\n' "$rc"
+_mole_privileged_path_has_mutable_ancestor() { return 1; }
+sudo() {
+    printf '%s\n' "$*" >> "$MOLE_SUDO_FIND_TRACE_DIR/scan-$SCAN_RC"
+    [[ "${1:-}" == "-n" ]] && shift
+    case "${1:-}" in
+        true) return 0 ;;
+        test)
+            shift
+            /bin/test "$@"
+            ;;
+        find)
+            printf '%s\0' "$TARGET_DIR/old.log"
+            return "$SCAN_RC"
+            ;;
+        /*) "$@" ;;
+        xargs)
+            cat > /dev/null
+            return 0
+            ;;
+        *) return 99 ;;
+    esac
+}
+for SCAN_RC in 124 0; do
+    rc=0
+    safe_sudo_find_delete "$TARGET_DIR" "*.log" "0" "f" "1" || rc=$?
+    printf 'SCAN_RC=%s RC=%s\n' "$SCAN_RC" "$rc"
+done
 SCRIPT
 
     [ "$status" -eq 0 ] || {
         echo "$output"
         return 1
     }
-    [[ "$output" == *"RC=124"* ]] || return 1
-    local trace_content
-    trace_content=$(< "$trace")
-    [[ "$trace_content" == *"-n find $target_dir -maxdepth 1 -name *.log -type f -print0"* ]] || return 1
-    [[ "$trace_content" != *"UNEXPECTED_DELETE"* ]] || return 1
+    [ ! -e "$trace_dir/real-sudo" ] || return 1
+    [[ "$output" == *"SCAN_RC=124 RC=124"* ]] || return 1
+    local timed_out_calls completed_calls
+    timed_out_calls=$(< "$trace_dir/scan-124")
+    completed_calls=$(< "$trace_dir/scan-0")
+    [[ "$timed_out_calls" == *"-n find $target_dir -maxdepth 1 -name *.log -type f -print0"* ]] || return 1
+    [[ "$timed_out_calls" != *"xargs"* ]] || return 1
+    [[ "$completed_calls" == *"-n xargs -0"* ]] || return 1
     [[ -e "$target_dir/old.log" ]]
 }
 
@@ -3118,40 +3130,43 @@ SCRIPT
 @test "safe_find_delete discards a timed-out partial scan" {
     local target_dir="$TEST_DIR/find-partial-target"
     local target_file="$target_dir/old.tmp"
-    local mock_bin="$TEST_DIR/find-partial-bin"
     local trace="$TEST_DIR/find-partial.trace"
-    mkdir -p "$target_dir" "$mock_bin"
+    mkdir -p "$target_dir"
     touch "$target_file"
 
-    # Two seconds, not one: under a loaded parallel run the mock's own startup
-    # can outlast a one-second budget before it records the call.
-    cat > "$mock_bin/find" <<'MOCK'
-#!/bin/bash
-printf 'find %s\n' "$*" >> "$MOLE_FIND_TRACE"
-printf '%s\0' "$TARGET_FILE"
-exec sleep 8
-MOCK
-    chmod +x "$mock_bin/find"
-
+    # run_with_timeout is replaced by what it leaves behind on expiry: the
+    # prefix the child printed, then status 124. A real mock find under a
+    # real budget raced its own startup against the clock, and the real
+    # wrapper has its own cases in core_timeout.bats. The second pass is the
+    # positive control: the same output with status 0 must reach the delete.
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" TARGET_DIR="$target_dir" \
-        TARGET_FILE="$target_file" MOLE_FIND_TRACE="$trace" PATH="$mock_bin:$PATH" \
-        MOLE_TIMEOUT_DISK_VERIFY_SEC=2 /bin/bash --noprofile --norc <<'SCRIPT'
+        TARGET_FILE="$target_file" MOLE_FIND_TRACE="$trace" \
+        MOLE_TIMEOUT_DISK_VERIFY_SEC=7 /bin/bash --noprofile --norc <<'SCRIPT'
 set -euo pipefail
 source "$PROJECT_ROOT/lib/core/common.sh"
-safe_remove() {
-    printf 'UNEXPECTED_DELETE:%s\n' "$1"
-    return 99
+run_with_timeout() {
+    printf '%s\n' "$*" >> "$MOLE_FIND_TRACE"
+    printf '%s\0' "$TARGET_FILE"
+    return "$SCAN_RC"
 }
-rc=0
-safe_find_delete "$TARGET_DIR" "*.tmp" "0" "f" || rc=$?
-printf 'RC=%s\n' "$rc"
+safe_remove() {
+    printf 'DELETE:%s\n' "$1"
+}
+for SCAN_RC in 124 0; do
+    rc=0
+    safe_find_delete "$TARGET_DIR" "*.tmp" "0" "f" || rc=$?
+    printf 'SCAN_RC=%s RC=%s\n' "$SCAN_RC" "$rc"
+done
 SCRIPT
 
     [ "$status" -eq 0 ] || return 1
-    [[ "$(< "$trace")" == *"$target_dir -maxdepth 5 -name *.tmp -type f -print0"* ]] || return 1
-    [[ "$output" == *"RC=124"* ]] || return 1
-    [[ "$output" != *"UNEXPECTED_DELETE"* ]] || return 1
-    [ -e "$target_file" ]
+    local first_call
+    read -r first_call < "$trace"
+    [[ "$first_call" == "7 find $target_dir -maxdepth 5 -name *.tmp -type f -print0" ]] || return 1
+    [[ "$output" == *"SCAN_RC=124 RC=124"* ]] || return 1
+    local timed_out_pass="${output%%SCAN_RC=124 RC=124*}"
+    [[ "$timed_out_pass" != *"DELETE:"* ]] || return 1
+    [[ "$output" == *"DELETE:$target_file"*"SCAN_RC=0 RC=0"* ]]
 }
 
 @test "safe_find_delete works when app protection is not loaded" {

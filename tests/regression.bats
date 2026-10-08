@@ -254,8 +254,8 @@ printf 'COUNT=%s ELAPSED_MS=%s\n' "${#normalized[@]}" "$elapsed_ms"
 printf '%s\n' "${normalized[@]}"
 
 [[ ${#normalized[@]} -eq 2 ]] || exit 1
-[[ "${normalized[0]}" == "$HOME/Library/Containers/com.microsoft.Excel/Data/Library/Caches" || "${normalized[1]}" == "$HOME/Library/Containers/com.microsoft.Excel/Data/Library/Caches" ]]
-[[ "${normalized[0]}" == "$HOME/Library/Containers/com.microsoft.Word/Data/Library/Caches" || "${normalized[1]}" == "$HOME/Library/Containers/com.microsoft.Word/Data/Library/Caches" ]]
+[[ "${normalized[0]}" == "$HOME/Library/Containers/com.microsoft.Excel/Data/Library/Caches" || "${normalized[1]}" == "$HOME/Library/Containers/com.microsoft.Excel/Data/Library/Caches" ]] || exit 1
+[[ "${normalized[0]}" == "$HOME/Library/Containers/com.microsoft.Word/Data/Library/Caches" || "${normalized[1]}" == "$HOME/Library/Containers/com.microsoft.Word/Data/Library/Caches" ]] || exit 1
 (( elapsed_ms < LIMIT_MS ))
 EOF
 
@@ -315,7 +315,7 @@ done < <(normalize_paths_for_cleanup "${paths[@]}")
 printf '%s\n' "${normalized[@]}"
 
 [[ ${#normalized[@]} -eq 2 ]] || exit 1
-[[ "${normalized[0]}" == "$HOME/.gradle/caches/8.13/groovy-dsl/abc123" || "${normalized[1]}" == "$HOME/.gradle/caches/8.13/groovy-dsl/abc123" ]]
+[[ "${normalized[0]}" == "$HOME/.gradle/caches/8.13/groovy-dsl/abc123" || "${normalized[1]}" == "$HOME/.gradle/caches/8.13/groovy-dsl/abc123" ]] || exit 1
 [[ "${normalized[0]}" == "$HOME/.gradle/caches/8.13/kotlin-dsl/def456" || "${normalized[1]}" == "$HOME/.gradle/caches/8.13/kotlin-dsl/def456" ]]
 EOF
 

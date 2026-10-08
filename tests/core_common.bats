@@ -1089,6 +1089,33 @@ EOF
     [[ "$output" == "last_tick=1000000" || "$output" == "last_tick=1000001" ]]
 }
 
+@test "update_progress_if_needed lets the shell clock advance the throttle" {
+    local spins="$HOME/spinner-advance"
+    # The epoch is read once and frozen by the stub, so only $SECONDS can move
+    # the clock. Jump it instead of sleeping: the throttle must hold inside the
+    # interval, then fire once the clock passes it.
+    # shellcheck disable=SC2016  # inner bash expands these from its environment
+    run env PROJECT_ROOT="$PROJECT_ROOT" SPINS="$spins" \
+        /bin/bash --noprofile --norc -c '
+            source "$PROJECT_ROOT/lib/core/common.sh"
+            get_epoch_seconds() { echo 1000000; }
+            start_section_spinner() { printf "%s\n" "$1" >> "$SPINS"; }
+            SECONDS=100
+            last_tick=0
+            update_progress_if_needed 1 10 last_tick 60 || exit 11
+            rc=0
+            update_progress_if_needed 2 10 last_tick 60 || rc=$?
+            [[ $rc -eq 1 ]] || exit 12
+            SECONDS=$((SECONDS + 100))
+            update_progress_if_needed 3 10 last_tick 60 || exit 13
+            echo "last_tick=$last_tick"
+        '
+    [ "$status" -eq 0 ] || { echo "status=$status"; return 1; }
+    [[ "$output" =~ ^last_tick=[0-9]+$ ]] || return 1
+    [ "${output#last_tick=}" -ge 1000100 ] || return 1
+    [[ "$(cat "$spins")" == $'Scanning items... 1/10\nScanning items... 3/10' ]]
+}
+
 @test "safe_clear_lines emits the same erase sequence per line to the target device" {
     local out="$HOME/clear-lines.out"
     run /bin/bash --noprofile --norc -c \

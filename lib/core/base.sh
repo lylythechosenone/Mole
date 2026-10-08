@@ -614,12 +614,12 @@ mole_filter_nested_paths() {
     return 0
 }
 
-# Wait in the owning shell so Bash 3.2 can reap any completed scan worker.
-# The first argument names a caller variable receiving the completed PID;
-# the return status belongs to that worker, or to an interrupted polling sleep.
 # Lowercase ASCII letters into the variable named by $1, the same bytes
-# `LC_ALL=C tr '[:upper:]' '[:lower:]'` produces, without a subprocess:
-# hot loops call this once per candidate, and each tr cost a fork.
+# `LC_ALL=C tr '[:upper:]' '[:lower:]'` produces in the C and UTF-8 locales,
+# without a subprocess: hot loops call this once per candidate, and each tr
+# cost a fork. Bash 3.2 expansion skips some letters after high bytes in
+# legacy multibyte locales (GBK, SJIS, Big5), so keep callers under the
+# LC_ALL=C that bin/clean.sh exports.
 mole_ascii_lowercase() {
     local _lowercase_value="${2:-}"
     _lowercase_value=${_lowercase_value//A/a}
@@ -651,6 +651,41 @@ mole_ascii_lowercase() {
     printf -v "$1" '%s' "$_lowercase_value"
 }
 
+# Escape operation records and deletion-log fields at their write boundaries.
+# Control bytes must never create audit records or terminal controls, so each
+# one is written as \n, \r, \t or \xHH. Backslashes stay literal: a name with
+# one reads back exactly as it is on disk, as it did before this escaping.
+# Only the logged copy changes, never the action path. mo history applies it
+# again when printing text, which leaves V1.59.0 rows untouched and escapes
+# the raw control bytes older logs may still hold.
+_mole_escape_log_value() {
+    local _output="$1" _value="$2" _escaped="" _char _code _index
+    local LC_ALL=C
+    if [[ "$_value" =~ [[:cntrl:]] ]]; then
+        for ((_index = 0; _index < ${#_value}; _index++)); do
+            _char="${_value:_index:1}"
+            case "$_char" in
+                $'\n') _escaped+='\n' ;;
+                $'\r') _escaped+='\r' ;;
+                $'\t') _escaped+='\t' ;;
+                *)
+                    if [[ "$_char" =~ [[:cntrl:]] ]]; then
+                        printf -v _code '\\x%02x' "'$_char"
+                        _escaped+="$_code"
+                    else
+                        _escaped+="$_char"
+                    fi
+                    ;;
+            esac
+        done
+        _value="$_escaped"
+    fi
+    printf -v "$_output" '%s' "$_value"
+}
+
+# Wait in the owning shell so Bash 3.2 can reap any completed scan worker.
+# The first argument names a caller variable receiving the completed PID;
+# the return status belongs to that worker, or to an interrupted polling sleep.
 mole_wait_for_any_worker() {
     local _wait_output_name="$1"
     shift

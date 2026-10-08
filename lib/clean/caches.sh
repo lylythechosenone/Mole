@@ -471,8 +471,8 @@ _project_cache_path_is_ascii() {
 }
 
 # Build the index for every candidate a matches file will reach. All Git
-# listings share one deadline; a repository that cannot be listed in time, or
-# whose listing fails, marks its candidates unknown. Signals propagate.
+# listings share the deadline given; a repository that cannot be listed in
+# time, or whose listing fails, marks its candidates unknown. Signals propagate.
 project_cache_build_git_index() {
     local matches_file="$1"
     local index_file="$2"
@@ -585,10 +585,15 @@ project_cache_build_git_index() {
             return 0
         fi
         # A candidate is tracked when a listed path equals it or lies below it.
-        tr '\0' '\n' < "$listing_file" | awk -F '\t' '
-            FNR == NR { want[$1] = $2; next }
+        # Case is folded on both sides: the disk may keep a folder's old
+        # spelling after a case-only rename while the index keeps the one Git
+        # saw, and a case-sensitive volume can only over-keep. Two candidates
+        # that differ only in case share a key, and the one that lost it is
+        # absent from the index, which keeps it.
+        tr '\0' '\n' < "$listing_file" | LC_ALL=C awk -F '\t' '
+            FNR == NR { want[tolower($1)] = $2; next }
             {
-                n = split($0, part, "/")
+                n = split(tolower($0), part, "/")
                 prefix = ""
                 for (i = 1; i <= n; i++) {
                     prefix = (i == 1) ? part[1] : prefix "/" part[i]
@@ -637,13 +642,8 @@ project_cache_git_status() {
 # a scan that cannot finish keeps the folder.
 _project_cache_holds_nested_repo() {
     local dir="$1"
-    local deadline="${2:-}"
     local found="" scan_rc=0
-    local timeout=""
-    timeout=$(_mole_timeout_with_deadline "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" "$deadline") || scan_rc=$?
-    if [[ $scan_rc -eq 0 ]]; then
-        found=$(run_with_timeout "$timeout" find -P "$dir" -mindepth 1 -name .git -print -quit 2> /dev/null) || scan_rc=$?
-    fi
+    found=$(run_with_timeout "$MOLE_TIMEOUT_MEDIUM_PROBE_SEC" find -P "$dir" -mindepth 1 -name .git -print -quit 2> /dev/null) || scan_rc=$?
     [[ $scan_rc -gt 128 ]] && return "$scan_rc"
     local reason=""
     if [[ $scan_rc -ne 0 ]]; then
@@ -674,9 +674,17 @@ project_cache_has_tracked_files() {
 # Discovery's repository index is only a filter, never deletion authority.
 # Re-read literal Git ancestry and nested repositories after sizing and at
 # safe_remove's final boundary. Files under .next/cache need the same check.
+#
+# Each probe draws on a bound of its own, never on a budget shared with the
+# other candidates: every deletion asks twice, so a shared one ran out on a few
+# hundred caches and the rest were silently kept.
+#
+# A refusal below concerns this path alone, so it names the path for a guarded
+# batch to skip and go on. Only the outer guard's refusal and a signal stop it.
 _project_cache_final_guard() {
-    local path="$1" deadline="${_project_cache_git_deadline:-$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))}"
-    local rc=0 evidence="" physical="" repo=""
+    local path="$1" git_deadline=$((SECONDS + MOLE_TIMEOUT_MEDIUM_PROBE_SEC))
+    local rc=0 evidence="" physical="" repo="" outer_rc=0
+    _MOLE_SAFE_CLEAN_SKIP_PATH="$path"
     [[ -e "$path" && ! -L "$path" ]] || return 1
     _mole_snapshot_path_identity "$path" || return 1
     local parent="$_MOLE_PATH_SNAPSHOT_PARENT" parent_id="$_MOLE_PATH_SNAPSHOT_PARENT_ID" target_id="$_MOLE_PATH_SNAPSHOT_TARGET_ID"
@@ -684,7 +692,8 @@ _project_cache_final_guard() {
     if mole_find_git_repo_root "$physical"; then
         repo="$MOLE_GIT_REPO_ROOT"
         [[ "$repo" != "$physical" ]] || return 1
-        evidence=$(mole_git_ls_files "$repo" "$deadline" "$parent" -- "${path##*/}") || rc=$?
+        mole_git_path_spec "$repo" "$physical"
+        evidence=$(mole_git_ls_files "$repo" "$git_deadline" "$repo" -- "$MOLE_GIT_PATH_SPEC") || rc=$?
         [[ $rc -le 128 ]] || return "$rc"
         if [[ $rc -ne 0 || -n "$evidence" ]]; then
             debug_log "Keeping project cache after Git recheck: $path (status $rc)"
@@ -693,14 +702,19 @@ _project_cache_final_guard() {
     fi
     if [[ -d "$path" ]]; then
         rc=0
-        _project_cache_holds_nested_repo "$path" "$deadline" || rc=$?
+        _project_cache_holds_nested_repo "$path" || rc=$?
         [[ $rc -le 128 ]] || return "$rc"
         [[ $rc -eq 1 ]] || return 1
     fi
     if [[ -n "${_project_cache_outer_guard:-}" ]]; then
-        "$_project_cache_outer_guard" "$path" || return $?
+        "$_project_cache_outer_guard" "$path" || outer_rc=$?
+        if [[ $outer_rc -ne 0 ]]; then
+            _MOLE_SAFE_CLEAN_SKIP_PATH=""
+            return "$outer_rc"
+        fi
     fi
     _mole_path_matches_identity "$path" "$parent" "$parent_id" "$target_id" || return 1
+    _MOLE_SAFE_CLEAN_SKIP_PATH=""
     _MOLE_SAFE_CLEAN_BOUND_PATH="$path"
     _MOLE_SAFE_CLEAN_EXPECTED_PARENT="$parent"
     _MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID="$parent_id"
@@ -746,9 +760,8 @@ clean_project_cache_target() {
         [[ -e "$target_path" ]] || continue
         local remove_rc=0
         safe_remove "$target_path" true || remove_rc=$?
-        if mole_rc_timeout_or_signal "$remove_rc"; then
-            return "$remove_rc"
-        fi
+        # Same policy as the guarded route: a removal timeout is not a stop.
+        [[ $remove_rc -lt 128 ]] || return "$remove_rc"
     done
 }
 
@@ -774,8 +787,10 @@ process_project_cache_matches() {
     local _project_cache_git_index=""
     local index_file="" index_rc=0
     index_file=$(create_temp_file) || return 0
+    # A fresh budget for each root: time spent cleaning an earlier root must not
+    # leave this one's listings with none.
     project_cache_build_git_index "$matches_file" "$index_file" \
-        "${_project_cache_git_deadline:-$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))}" || index_rc=$?
+        "$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))" || index_rc=$?
     if [[ $index_rc -ne 0 ]]; then
         rm -f "$index_file" # SAFE: exact scratch file created by create_temp_file above
         [[ $index_rc -gt 128 ]] && return "$index_rc"
@@ -823,8 +838,11 @@ _process_project_cache_matches_indexed() {
                 current_python_root=""
                 current_python_dirs=()
                 if [[ -d "$cache_dir" ]]; then
-                    # build/ counts as Flutter output only beside a disposable
-                    # .dart_tool; a kept one leaves no evidence for it.
+                    # build/ counts as Flutter output only beside a .dart_tool,
+                    # so one that Git tracks or cannot answer for leaves it
+                    # alone. A .dart_tool kept for another reason (a whitelist
+                    # entry, a nested repository) says nothing about build/,
+                    # which passes its own checks below.
                     local tracked_rc=0
                     project_cache_has_tracked_files "$cache_dir" || tracked_rc=$?
                     [[ $tracked_rc -le 128 ]] || return "$tracked_rc"
@@ -909,9 +927,9 @@ clean_python_bytecode_cache_group() {
         else
             local remove_rc=0
             safe_remove "$cache_dir" true "$size_kb" || remove_rc=$?
-            if mole_rc_timeout_or_signal "$remove_rc"; then
-                return "$remove_rc"
-            fi
+            # A removal timeout (124) is one failed removal, as in
+            # _safe_clean_impl: only a signal ends the run.
+            [[ $remove_rc -lt 128 ]] || return "$remove_rc"
             [[ $remove_rc -eq 0 ]] || continue
         fi
 
@@ -1105,8 +1123,6 @@ clean_project_caches() {
         fi
     done
 
-    # One Git budget for every root's tracked-file index.
-    local _project_cache_git_deadline=$((SECONDS + MOLE_TIMEOUT_HINT_SCAN_SEC))
     for ((scan_index = 0; scan_index < ${#root_matches_files[@]}; scan_index++)); do
         root_matches_file="${root_matches_files[$scan_index]}"
         local scan_rc="${scan_statuses[$scan_index]:-1}"

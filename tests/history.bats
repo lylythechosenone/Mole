@@ -59,6 +59,122 @@ assert s["actions"]["failed"] == 0, s
     [ "$status" -eq 0 ]
 }
 
+@test "audit logs keep backslash names verbatim while control bytes stay escaped" {
+    local log_dir="$HOME/Library/Logs/mole"
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 MOLE_DELETE_LOG="$log_dir/deletions.log" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+mkdir -p "$HOME/work"
+for name in 'back\slash.txt' 'lit\n-backslash-n.txt' 'tail\'; do
+    : > "$HOME/work/$name"
+    mole_delete "$HOME/work/$name" || exit 1
+    [[ ! -e "$HOME/work/$name" ]] || exit 1
+done
+kept="$HOME/work/ctl"$'\t'"x"
+: > "$kept"
+if mole_delete "$kept"; then exit 1; fi
+[[ -f "$kept" ]] || exit 1
+log_operation_session_start clean
+log_operation clean SKIPPED 'lit\name' 'back\slash'
+log_operation clean SKIPPED $'real\nname' $'tab\there'
+log_operation_session_end clean 2 0
+EOF
+    [ "$status" -eq 0 ]
+
+    # A literal backslash survives into the record; a real newline stays one record.
+    run python3 -c '
+import pathlib, sys
+b = pathlib.Path(sys.argv[1]).read_bytes()
+assert b"SKIPPED lit\\name (back\\slash)\n" in b, b
+assert b"SKIPPED real\\nname (tab\\there)\n" in b, b
+lines = [l for l in b.split(b"\n") if l]
+assert len(lines) == 7, lines
+assert all(l.startswith((b"[", b"# ==========")) for l in lines), lines
+assert not any(c < 32 and c != 10 or c == 127 for c in b), b
+' "$log_dir/operations.log"
+    [ "$status" -eq 0 ]
+
+    run env HOME="$HOME" MOLE_DELETE_LOG="$log_dir/deletions.log" "$PROJECT_ROOT/mole" history --json
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | WORK_DIR="$HOME/work" python3 -c '
+import json, os, sys
+work = os.environ["WORK_DIR"]
+rows = {d["path"]: d["status"] for d in json.load(sys.stdin)["deletions"]}
+for name in ("back\\slash.txt", "lit\\n-backslash-n.txt", "tail\\"):
+    assert rows.get(work + "/" + name) == "ok", (name, rows)
+assert rows.get(work + "/ctl\\tx") == "rejected", rows
+'
+}
+
+@test "operation log escaping leaves no control byte for any byte value" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+for ((code = 1; code < 256; code++)); do
+    printf -v octal '\\%03o' "$code"
+    printf -v ch "$octal"
+    append_log_line "$OPERATIONS_LOG_FILE" "${ch}"
+    append_log_line "$OPERATIONS_LOG_FILE" "a${ch}b${ch}${ch}c"
+    append_log_lines "$OPERATIONS_LOG_FILE" "x${ch}y" "${ch}"
+done
+EOF
+    [ "$status" -eq 0 ]
+    run python3 -c '
+import pathlib, sys
+b = pathlib.Path(sys.argv[1]).read_bytes()
+assert b.count(b"\n") == 255 * 4, b.count(b"\n")
+assert not any(c < 32 and c != 10 or c == 127 for c in b)
+assert b"a\\x1bb\\x1b\\x1bc\n" in b and b"a\\nb\\n\\nc\n" in b and b"a\\tb\\t\\tc\n" in b
+assert b"\n\\x7f\n" in b and b"\n\\x01\n" in b
+assert b"\n\\\n" in b and b"a\\b\\\\c\n" in b, "backslash must stay literal"
+' "$HOME/Library/Logs/mole/operations.log"
+    [ "$status" -eq 0 ]
+}
+
+@test "mo history text prints legacy control bytes escaped and keeps JSON content" {
+    local esc=$'\033'
+    {
+        printf '# ========== clean session started at 2026-05-24 10:00:00 ==========\n'
+        printf '[2026-05-24 10:00:01] [clean] REMOVED /tmp/cache one (2KB)\n'
+        printf '# ========== clean session ended at 2026-05-24 10:00:05, 1 items, %s[2J6KB ==========\n' "$esc"
+        printf '[2026-05-24 10:01:00] [cl%s[31mean] REMOVED /tmp/other (1KB)\n' "$esc"
+    } > "$HOME/Library/Logs/mole/operations.log"
+    {
+        printf '2026-05-24T10:00:02+0000\ttrash\t4\tok\t/tmp/Old App.app\n'
+        printf '2026-05-24T10:00:03+0000%s[2J\ttrash\t4\tok\t/tmp/evil%s[31mRED\rend\n' "$esc" "$esc"
+        printf '2026-05-24T10:00:04+0000\tperm%s]0;title\a\t4\tok\t/tmp/mode\n' "$esc"
+    } > "$HOME/Library/Logs/mole/deletions.log"
+
+    run env HOME="$HOME" "$PROJECT_ROOT/mole" history
+    [ "$status" -eq 0 ]
+    # Positive controls: the escaped spellings and the clean row are present.
+    [[ "$output" == *'/tmp/evil\x1b[31mRED\rend'* ]] || return 1
+    [[ "$output" == *'2026-05-24T10:00:03+0000\x1b[2J'* ]] || return 1
+    [[ "$output" == *'perm\x1b]0;title\x07'* ]] || return 1
+    [[ "$output" == *'1 items, \x1b[2J6KB'* ]] || return 1
+    [[ "$output" == *'cl\x1b[31mean'* ]] || return 1
+    [[ "$output" == *'/tmp/Old App.app'* ]] || return 1
+    # Only the colored heading may carry an escape byte.
+    printf '%s\n' "$output" | python3 -c '
+import sys
+lines = sys.stdin.buffer.read().split(b"\n")
+bad = [l for l in lines if b"\x1b" in l and b"Mole History" not in l]
+assert not bad, bad
+assert not any(b"\r" in l or b"\x07" in l for l in lines), lines
+'
+
+    run env HOME="$HOME" "$PROJECT_ROOT/mole" history --json
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+paths = {d["path"] for d in data["deletions"]}
+assert "/tmp/evil\x1b[31mRED\rend" in paths, paths
+assert {d["timestamp"] for d in data["deletions"]} >= {"2026-05-24T10:00:03+0000\x1b[2J"}, data["deletions"]
+assert any(s["size"] == "\x1b[2J6KB" for s in data["sessions"]), data["sessions"]
+'
+}
+
 @test "mo history summarizes operation sessions and deletion audit" {
     write_history_logs
 
@@ -493,6 +609,97 @@ assert sessions[0]["started_at"] == "2026-05-10 10:00:01", sessions[0]
 assert sessions[0]["actions"]["trashed"] == 1, sessions[0]
 assert sessions[2]["actions"]["trashed"] == 1, sessions[2]
 '
+}
+
+@test "mo history closes parked marker-less sessions at the next marker and keeps marked ones" {
+    # installer and uninstall write no start marker, so a start marker for
+    # another command ends both even while installer waits behind uninstall.
+    cat > "$HOME/Library/Logs/mole/operations.log" <<'EOF'
+[2026-10-08 10:00:01] [installer] REMOVED /tmp/a (1KB)
+[2026-10-08 10:00:02] [uninstall] REMOVED /tmp/b (1KB)
+# ========== clean session started at 2026-10-08 10:00:03 ==========
+[2026-10-08 10:00:04] [clean] REMOVED /tmp/c (1KB)
+[2026-10-08 10:00:05] [installer] REMOVED /tmp/d (1KB)
+# ========== clean session ended at 2026-10-08 10:00:06, 1 items, 1KB ==========
+EOF
+    run env HOME="$HOME" "$PROJECT_ROOT/mole" history --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" | python3 -c '
+import json, sys
+sessions = json.load(sys.stdin)["sessions"]
+installers = [s for s in sessions if s["command"] == "installer"]
+assert len(installers) == 2, sessions
+assert all(s["actions"]["removed"] == 1 for s in installers), installers
+assert [s["command"] for s in sessions] == ["installer", "uninstall", "clean", "installer"][::-1], sessions
+'
+
+    # A parked session that a start marker opened keeps waiting for its own
+    # actions and end marker.
+    cat > "$HOME/Library/Logs/mole/operations.log" <<'EOF'
+# ========== purge session started at 2026-10-08 10:00:01 ==========
+[2026-10-08 10:00:02] [purge] REMOVED /tmp/a (1KB)
+[2026-10-08 10:00:03] [uninstall] REMOVED /tmp/b (1KB)
+# ========== clean session started at 2026-10-08 10:00:04 ==========
+[2026-10-08 10:00:05] [purge] REMOVED /tmp/c (1KB)
+# ========== clean session ended at 2026-10-08 10:00:06, 0 items, 0B ==========
+# ========== purge session ended at 2026-10-08 10:00:07, 2 items, 2KB ==========
+EOF
+    run env HOME="$HOME" "$PROJECT_ROOT/mole" history --json
+    [ "$status" -eq 0 ] || return 1
+    printf '%s\n' "$output" | python3 -c '
+import json, sys
+sessions = json.load(sys.stdin)["sessions"]
+purges = [s for s in sessions if s["command"] == "purge"]
+assert len(purges) == 1, sessions
+assert purges[0]["actions"]["removed"] == 2 and purges[0]["ended_at"] == "2026-10-08 10:00:07", purges
+'
+}
+
+@test "mo history load time does not grow with runs that never wrote an end marker" {
+    # Compare against the same number of finished runs so the bound holds on
+    # any host: finished runs never wait, interrupted ones used to be rescanned
+    # for every new run and took several times longer.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" python3 - <<'PY'
+import os
+import subprocess
+import time
+
+home = os.environ["HOME"]
+root = os.environ["PROJECT_ROOT"]
+log = os.path.join(home, "Library/Logs/mole/operations.log")
+
+
+def write_log(ended):
+    lines = []
+    for i in range(400):
+        rid = "20261008%06d-1-%d-%d" % (i, i, i)
+        lines.append("# ========== clean run=%s session started at 2026-10-08 10:00:00 ==========" % rid)
+        for j in range(10):
+            lines.append("[2026-10-08 10:00:00] [clean run=%s] REMOVED /tmp/cache-%d-%d (1KB)" % (rid, i, j))
+        if ended:
+            lines.append("# ========== clean run=%s session ended at 2026-10-08 10:00:01, 10 items, 1KB ==========" % rid)
+    with open(log, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def load_seconds(ended):
+    write_log(ended)
+    best = None
+    for _ in range(2):
+        start = time.perf_counter()
+        subprocess.run([root + "/mole", "history", "--json"], env=dict(os.environ, HOME=home),
+                       stdout=subprocess.DEVNULL, check=True)
+        elapsed = time.perf_counter() - start
+        best = elapsed if best is None else min(best, elapsed)
+    return best
+
+
+finished = load_seconds(True)
+interrupted = load_seconds(False)
+print("finished=%.2fs interrupted=%.2fs" % (finished, interrupted))
+assert interrupted < 2.0 * finished, (finished, interrupted)
+PY
+    [ "$status" -eq 0 ]
 }
 
 @test "mo history does not create logs when none exist" {

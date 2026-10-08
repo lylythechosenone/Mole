@@ -80,15 +80,96 @@ Google Chrome Helper (Renderer)' '/sbin/launchd
 @test "browser clone snapshot refuses parent unknown vendor extra files and symlinks" {
     run _mole_browser_clone_snapshot "${CLONE%/*}"
     [ "$status" -ne 0 ]
-    touch "$CLONE/personal.txt"
+    # Sorts before the bundle, so the bundle is still the last entry listed
+    # and only the entry count refuses the clone.
+    touch "$CLONE/AAA-personal.txt"
     run _mole_browser_clone_snapshot "$CLONE"
     [ "$status" -ne 0 ]
-    /bin/rm "$CLONE/personal.txt" # SAFE: test-owned fixture
+    /bin/rm "$CLONE/AAA-personal.txt" # SAFE: test-owned fixture
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
     mv "$BUNDLE" "$HOME/saved-bundle"
     ln -s "$HOME/saved-bundle" "$BUNDLE"
     run _mole_browser_clone_snapshot "$CLONE"
     [ "$status" -ne 0 ]
-    run _mole_browser_clone_snapshot "$CLONE_ROOT/com.crowdstrike.falcon.code_sign_clone/code_sign_clone.A123bc"
+}
+
+@test "browser clone snapshot refuses an unknown vendor clone shaped like Chrome" {
+    local other="$CLONE_ROOT/com.crowdstrike.falcon.code_sign_clone/code_sign_clone.A123bc"
+    # The same shape under an allowlisted id is accepted.
+    cp -R "$CLONE" "${CLONE%/*}/code_sign_clone.B234cd"
+    run _mole_browser_clone_snapshot "${CLONE%/*}/code_sign_clone.B234cd"
+    [ "$status" -eq 0 ]
+    mkdir -p "${other%/*}"
+    cp -R "$CLONE" "$other"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.crowdstrike.falcon' "$other/Google Chrome.app/Contents/Info.plist"
+    # Only the id allowlist is left to refuse it.
+    run _mole_browser_clone_snapshot "$other"
+    [ "$status" -ne 0 ]
+}
+
+@test "browser clone cleanup retains a clone reached through a symlinked directory" {
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
+    mv "${CLONE%/*}" "$HOME/real-id-dir"
+    ln -s "$HOME/real-id-dir" "${CLONE%/*}"
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -ne 0 ]
+    clean_browser_code_sign_clones
+    [ ! -s "$CALLS" ]
+    [ "$code_sign_cleaned" -eq 0 ]
+    [ -d "$HOME/real-id-dir/code_sign_clone.A123bc" ]
+}
+
+@test "browser clone snapshot refuses a clone name that is not six characters" {
+    cp -R "$CLONE" "${CLONE%?}d"
+    run _mole_browser_clone_snapshot "${CLONE%?}d"
+    [ "$status" -eq 0 ]
+    cp -R "$CLONE" "${CLONE}x"
+    run _mole_browser_clone_snapshot "${CLONE}x"
+    [ "$status" -ne 0 ]
+}
+
+@test "browser clone snapshot refuses a clone nested below the clone directory" {
+    local nested="${CLONE%/*}/nest/${CLONE##*/}"
+    mkdir -p "${nested%/*}"
+    cp -R "$CLONE" "$nested"
+    run _mole_browser_clone_snapshot "$nested"
+    [ "$status" -ne 0 ]
+    # Positive control: the same clone at the allowed depth is accepted.
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
+}
+
+@test "browser clone snapshot refuses a bundle that is not named for its vendor app" {
+    mv "$BUNDLE" "$CLONE/Other.app"
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -ne 0 ]
+}
+
+@test "browser clone snapshot refuses a plist whose executable is another app" {
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable Other' "$BUNDLE/Contents/Info.plist"
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -ne 0 ]
+}
+
+@test "browser clone snapshot refuses an oversized plist" {
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
+    /usr/libexec/PlistBuddy -c "Add :Filler string $(head -c 70000 /dev/zero | tr '\0' a)" "$BUNDLE/Contents/Info.plist"
+    [ "$(/usr/bin/stat -f %z "$BUNDLE/Contents/Info.plist")" -gt 65536 ]
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -ne 0 ]
+}
+
+@test "browser clone snapshot refuses an executable that is not a regular file" {
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
+    /bin/rm "$BUNDLE/Contents/MacOS/Google Chrome" # SAFE: test-owned fixture
+    mkdir "$BUNDLE/Contents/MacOS/Google Chrome"
+    run _mole_browser_clone_snapshot "$CLONE"
     [ "$status" -ne 0 ]
 }
 
@@ -115,15 +196,21 @@ Google Chrome Helper'
     [ "$code_sign_cleaned" -eq 0 ]
 }
 
-@test "replacing a reviewed clone at final removal guard retains it" {
+@test "replacing a reviewed clone with a valid copy before its identity is bound retains it" {
+    # The sink binds whatever stands at the path when the identity is taken,
+    # so a swap after the review snapshot is caught only by the snapshot
+    # comparison in the final guard. The copy passes every structural check.
+    eval "real_$(declare -f _mole_snapshot_path_identity)"
     # shellcheck disable=SC2329 # Called indirectly by the sourced cleanup implementation.
-    safe_remove() {
-        mv "$CLONE" "$CLONE.replaced"
-        mkdir -p "$CLONE"
-        "$_MOLE_SAFE_REMOVE_FINAL_GUARD" "$1" || return 1
-        printf 'unexpected\n' >>"$CALLS"
+    _mole_snapshot_path_identity() {
+        cp -R "$1" "$1.copy"
+        mv "$1" "$1.replaced"
+        mv "$1.copy" "$1"
+        real__mole_snapshot_path_identity "$@"
     }
     clean_browser_code_sign_clones
+    run _mole_browser_clone_snapshot "$CLONE"
+    [ "$status" -eq 0 ]
     [ ! -s "$CALLS" ]
     [ "$code_sign_cleaned" -eq 0 ]
 }

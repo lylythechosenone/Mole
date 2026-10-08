@@ -333,6 +333,12 @@ clean_homebrew() {
         run_with_timeout "$cleanup_timeout" brew cleanup --prune=30 > "$brew_tmp_file" 2>&1 || brew_exit=$?
     if [[ -t 1 ]]; then stop_inline_spinner; fi
     restore_homebrew_active_links
+    if mole_rc_signal "$brew_exit"; then
+        # Ctrl-C while brew holds the terminal reaches only the child.
+        debug_log "Homebrew cleanup: owner command interrupted (exit $brew_exit)"
+        _mole_record_clean_cancellation "$brew_exit" "Homebrew cleanup"
+        return "$brew_exit"
+    fi
 
     local brew_success=false
     if [[ $brew_exit -eq 0 ]]; then

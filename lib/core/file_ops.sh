@@ -2348,6 +2348,8 @@ _mole_report_unverified_delete() {
 #
 # Returns 0 on success and a nonzero MOLE_ERR_* code on failure. Always appends a tab-separated line to
 # the deletions log: <iso_ts>\t<mode>\t<size_kb>\t<status>\t<path>.
+# Control bytes in any field are written as \n, \r, \t or \xHH so a name cannot
+# start a record; backslashes stay literal.
 # size_kb is "unknown" when du could not measure the path (permission denied,
 # disappeared mid-call); never silently coerced to 0KB so post-hoc forensics
 # can tell measured-zero from measurement-failure.

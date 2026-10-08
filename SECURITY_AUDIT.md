@@ -1,6 +1,6 @@
 # Mole Security Audit
 
-This document describes the security-relevant behavior prepared for V1.59.0 on the current `main` branch, updated on 2026-10-07. It is intended as a public description of Mole's safety boundaries, destructive-operation controls, release integrity signals, and known limitations.
+This document describes the security-relevant behavior prepared for V1.59.0 on the current `main` branch, updated on 2026-10-08. It is intended as a public description of Mole's safety boundaries, destructive-operation controls, release integrity signals, and known limitations.
 
 ## Executive Summary
 
@@ -55,8 +55,8 @@ Core controls include:
 - uninstall removal flows that move items to Trash use `mole_delete`, which validates the path again and records the operation result. `mole_delete` now also validates symlinks instead of skipping them, and normalizes the target by collapsing repeated slashes and stripping a trailing slash before the protected-path check, so equivalent path spellings cannot slip past protection.
 - incomplete download cleanup skips files currently open (lsof check) and uses quoted glob patterns to prevent word-splitting on filenames that contain spaces
 - live user-cache protection refuses any reverse-DNS directory under `~/Library/Caches` whose owner is still running. Deleting an open SQLite cache can send the owning helper into a loop writing to unlinked files until the volume fills, observed with Autodesk Fusion's background helpers (issue #1390). The owner probe is tri-state and denies on both "running" and "could not tell": an unreadable process table is never read as idle. For SQLite cache families, the base database plus any `-wal` and `-shm` companions are covered by one bounded `lsof` probe over the whole family; cleanup proceeds only after every existing member is conclusively idle. Both of that probe's signals count as "in use", a record on stdout or a clean exit status, because with several names in one query neither alone is complete. A stale `-shm` file alone is not treated as liveness evidence, while a missing, timed-out, or failed `lsof` probe denies cleanup. The gate runs inside `validate_path_for_deletion()` and again at the `safe_remove()` sink, so a helper that launches after sizing still blocks deletion. The same protection covers the generic `~/Library/Caches/*` sweep, not only app-specific cleaners
-- `mo clean` does not touch the LaunchServices database. A per-record removal is not implementable: `lsregister -u` resolves the path before unregistering, so on macOS 15 and later it returns `-10814` for exactly the records whose app is already gone. The only supported repair is a domain rescan, which is an explicit user-triggered task in `mo optimize` (`opt_launch_services_rebuild`), never an automatic step inside cleanup
-- uninstall leftover removal is gated by a shared-bundle-id sibling guard: when another install of the same bundle id is still present, shared leftovers are kept and only the selected bundle is removed. Absence of a sibling must be proven, not assumed, so the scan reports three states and only a complete "no other install" result unlocks full leftover removal; a timeout, an unreadable volume, or an unreadable bundle degrades to the narrowed plan. The one volume left out is a network share whose mount point reports that it no longer exists, such as a stopped virtual machine's drive, because nothing on it can be a live install; a slow or reconnecting share still counts as unknown. The package-receipt half of that evidence is cached on disk keyed by a checksum of the installed receipt list rather than by time alone, because a TTL cannot prove completeness and a package installed after the last write would otherwise stay invisible to the guard
+- `mo clean` does not touch the LaunchServices database. A per-record removal is not implementable: `lsregister -u` resolves the path before unregistering, so on macOS 15 and later it returns `-10814` for exactly the records whose app is already gone. No command offers a domain rescan either: `mo optimize` no longer re-registers LaunchServices because the rebuild made a running Network Extension VPN read as reinstalled, and uninstall only unregisters the removed bundle with `lsregister -u` and compacts with `lsregister -gc`, never a domain-wide rebuild. A catalog test refuses any `lsregister -r` call in `lib` and `bin` (`tests/optimize_catalog.bats`)
+- uninstall leftover removal is gated by a shared-bundle-id sibling guard: when another install that shares the bundle id is still present, shared leftovers are kept and only the selected bundle is removed. The guard also treats an independent bundle whose id continues the selected one after a dot, in either direction, and a channel-stripped same-name product such as a Nightly build beside the stable app, as the same family. Ownership is checked again at the leftover boundary after the app move: a replacement at the original app path, a surviving family member or an incomplete inventory keeps the whole family, the refusal carries through defaults, ByHost and helper bootout, and the summary names the cause once instead of listing every path as protected. Absence of a sibling must be proven, not assumed, so the scan reports three states and only a complete "no other install" result unlocks full leftover removal; a timeout, an unreadable volume, or an unreadable bundle degrades to the narrowed plan. The one volume left out is a network share whose mount point reports that it no longer exists, such as a stopped virtual machine's drive, because nothing on it can be a live install; a slow or reconnecting share still counts as unknown. The package-receipt half of that evidence is cached on disk keyed by a checksum of the installed receipt list rather than by time alone, because a TTL cannot prove completeness and a package installed after the last write would otherwise stay invisible to the guard
 - orphaned system-service cleanup in `mo clean` (`lib/clean/apps.sh` `clean_orphaned_system_services`) runs only when sudo is already available, scans `/Library/{LaunchDaemons,LaunchAgents,PrivilegedHelperTools}` while skipping `com.apple.*`, and flags an entry only when its launchd `Program`/`ProgramArguments[0]` path is absolute and missing, or a `PrivilegedHelperTools` helper whose parent app is uninstalled (`bundle_has_installed_app`). Package-manager and system binary locations, a known-helper protect list, mdfind-resolved installed apps, the whitelist, and `should_protect_path` (with `SYSTEM_CRITICAL_BUNDLES` still enforced) all exclude entries before removal. Root-owned plists are read with non-interactive sudo and fail closed, so an unreadable plist is never misread as a missing binary. A standalone helper app under `/Library/PrivilegedHelperTools/*.app/Contents/MacOS/*` remains protected even while its updater temporarily removes the executable leaf. Before any direct helper file is deleted, Mole completely re-scans LaunchDaemons and LaunchAgents and keeps the helper if a surviving plist still references it or the reference scan is inconclusive. Removal routes through guarded `safe_sudo_remove`, does not alter launchd state, and honors dry-run (issues #1082 and #1447)
 
 Blocked paths remain protected even with sudo. Examples include:
@@ -133,7 +133,7 @@ In addition to path blocking, these categories are protected:
 
 ## Implementation Details
 
-All deletion routes pass through `lib/core/file_ops.sh`:
+All cleanup and app-data deletion routes pass through `lib/core/file_ops.sh`:
 
 - `validate_path_for_deletion()` - Empty, relative, traversal checks
 - `should_protect_path()` - Prefix and pattern matching
@@ -258,15 +258,16 @@ Mole exposes multiple safety controls before and during destructive actions:
 - operation logs are written to `~/Library/Logs/mole/operations.log` unless disabled with `MO_NO_OPLOG=1`
 - `mole_delete` Trash and permanent deletion attempts are also recorded by the file-operation layer with result status, target path, and error context where available
 - `mo history` (`lib/core/history.sh`) is read-only: it reads `operations.log` and `deletions.log` to surface recent cleanup activity and performs no deletion or out-of-bounds writes
-- operation-log records and deletion-log fields escape control bytes and backslashes before append, including batched records, so filenames cannot forge history entries
+- operation-log records and deletion-log fields escape control bytes as `\n`, `\r`, `\t` or `\xHH` before append, including batched records, so filenames cannot forge history entries; backslashes stay literal so `mo history` shows names as they are on disk, and its text output escapes the raw control bytes that older logs may still hold
 - timeouts bound external commands so stalled discovery or uninstall operations do not silently hang the entire flow
 - Purge preserves interruption statuses through content probes, parallel discovery, review, and deletion; a read timeout remains unknown and keeps the target
 - project-cache cleanup rechecks tracked files and nested repositories after sizing and at the final deletion boundary; the discovery Git index alone never authorizes deletion
 
 Relevant timeout behavior includes:
 
-- orphan and Spotlight checks: 2s
-- LaunchServices rebuild during uninstall: bounded 10s and 15s steps
+- orphan app lookups through Spotlight (`mdfind`): 5s
+- plist and binary probes, and installed-app resolution by bundle ID: 2s
+- LaunchServices steps during uninstall: `lsregister -u` 5s and `lsregister -gc` 10s
 - Homebrew uninstall cask flow: 300s by default, extended for large apps when needed
 - project scans and sizing operations: bounded to avoid whole-home stalls
 
@@ -297,7 +298,7 @@ Repository-level signals include:
 
 These controls do not eliminate all supply-chain risk, but they make release changes easier to review and verify.
 
-Installers serialize custom configuration paths as literal shell data before embedding the launcher assignment. Self-removal recognizes released Mole launcher signatures without executing discovered files, and checks them again after confirmation; an unrelated command named `mo` or `mole` is retained.
+Installers serialize custom configuration paths as literal shell data in the C locale before embedding the launcher assignment, so the launcher stays ASCII. Self-removal recognizes released Mole launcher signatures without executing discovered files, reading them as bytes so launchers pinned to non-ASCII paths by earlier builds still count, and checks them again after confirmation; an unrelated command named `mo` or `mole` is retained.
 
 ## Testing Coverage
 
@@ -355,6 +356,7 @@ Key coverage areas include:
 - Localized app names may still be missed in some heuristic paths, though bundle IDs are preferred where available.
 - Users who want immediate removal of app data should use explicit uninstall flows rather than waiting for orphan cleanup.
 - Release artifacts include checksums and attestations, but downstream package-manager trust also depends on external distribution infrastructure.
+- Operation and deletion logs write control bytes as `\n`, `\r`, `\t` or `\xHH` and leave backslashes literal, so a filename holding a backslash followed by `n` reads the same as one holding a newline. Every call still appends one record, so nothing can be forged; only that one shape is ambiguous.
 - `mo history --json` escapes strings byte by byte under `LC_ALL=C` (`history_json_escape`) for portable behavior on bash 3.2. Printable multibyte bytes are emitted verbatim, so the emitted JSON stays valid UTF-8, but the escaper does not perform Unicode-aware codepoint iteration. This is a known display-layer detail, not a correctness issue.
 - Planned follow-up work includes stronger destructive-command threat modeling, more regression coverage for high-risk paths, and continued hardening of release integrity and disclosure workflow.
 

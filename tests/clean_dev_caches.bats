@@ -1204,6 +1204,59 @@ EOF
     [[ "$output" == *"Orphaned bun cache|$HOME/.bun/install/cache/*"* ]]
 }
 
+@test "clean_dev_npm stops on an interrupted bun cache removal instead of removing it directly" {
+    # Ctrl-C while `bun pm cache rm` holds the terminal reaches only the child.
+    # A signal stops cleanup; a plain failure, a timeout or an errno-derived
+    # status above 127 still falls back to the filesystem.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+clean_pnpm_stores() { :; }
+clean_corepack_cache() { :; }
+clean_tool_cache() { :; }
+safe_clean() { echo "SAFE_CLEAN:$2"; }
+note_activity() { :; }
+debug_log() { :; }
+run_with_timeout() { shift; "$@"; }
+npm() { return 0; }
+bun() {
+    if [[ "$1" == "--version" ]]; then
+        echo "1.2.0"
+        return 0
+    fi
+    if [[ "$1" == "pm" && "$2" == "cache" && "${3:-}" == "rm" ]]; then
+        return "$BUN_RM_RC"
+    fi
+    if [[ "$1" == "pm" && "$2" == "cache" ]]; then
+        echo "/tmp/mole-bun-cache"
+        return 0
+    fi
+    return 0
+}
+for BUN_RM_RC in 130 143 1 124 243; do
+    MOLE_CLEAN_CANCEL_STATUS=0
+    MOLE_CLEAN_CANCEL_SOURCE=""
+    rc=0
+    clean_dev_npm > "$HOME/bun-case.out" || rc=$?
+    fallback=$(grep -c '^SAFE_CLEAN:Bun cache$' "$HOME/bun-case.out" || true)
+    printf 'BUN=%s RC=%s CANCEL=%s SOURCE=%s FALLBACK=%s\n' \
+        "$BUN_RM_RC" "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$MOLE_CLEAN_CANCEL_SOURCE" "$fallback"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"BUN=130 RC=130 CANCEL=130 SOURCE=bun cache FALLBACK=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BUN=143 RC=143 CANCEL=143 SOURCE=bun cache FALLBACK=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BUN=1 RC=0 CANCEL=0 SOURCE= FALLBACK=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BUN=124 RC=0 CANCEL=0 SOURCE= FALLBACK=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BUN=243 RC=0 CANCEL=0 SOURCE= FALLBACK=1"* ]] || { echo "$output"; return 1; }
+    rm -f "$HOME/bun-case.out" # SAFE: test scratch file under the temporary HOME
+}
+
 @test "clean_dev_docker skips daemon-managed cleanup by default" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -3049,6 +3102,59 @@ EOF
     rm -rf "$module_root" "$build_root"
 }
 
+@test "clean_dev_go treats an errno-derived go clean exit as a failure, not an interrupt" {
+    # An owner command can exit above 127 without a signal (npm's 243 is an
+    # errno), which is an ordinary failure: only a status that names a signal
+    # cancels the run. The build cache still runs after the failed module cache.
+    local module_root="$HOME/go-module-errno"
+    local build_root="$HOME/go-build-errno"
+    local trace="$HOME/go-clean-errno.trace"
+    mkdir -p "$module_root" "$build_root"
+    rm -f "$trace"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+MOLE_CURRENT_COMMAND=clean
+MOLE_CLEAN_CANCEL_STATUS=0
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        if [[ "$3" == "GOMODCACHE" ]]; then
+            printf '%s\n' "$GO_MODULE_ROOT"
+        else
+            printf '%s\n' "$GO_BUILD_ROOT"
+        fi
+        return 0
+    fi
+    printf '%s\n' "$*" >> "$GO_TRACE"
+    [[ "$*" == *"-modcache"* ]] && return 243
+    return 0
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+clean_rc=0
+clean_dev_go || clean_rc=$?
+printf 'rc=%s\n' "$clean_rc"
+printf 'CANCEL=%s\n' "${MOLE_CLEAN_CANCEL_STATUS:-0}"
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"rc=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"CANCEL=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"Go module cache · stopped (owner cleanup failed)"* ]] || { echo "$output"; return 1; }
+    grep -qFx "env GOCACHE=$build_root go clean -cache" "$trace" || return 1
+    rm -f "$trace"
+    rm -rf "$module_root" "$build_root"
+}
+
 @test "clean_dev_go propagates an interrupted owner cleanup" {
     local module_root="$HOME/go-module-cancel"
     mkdir -p "$module_root"
@@ -3086,6 +3192,68 @@ EOF
     [[ "$output" == *"CANCEL=130"* ]] || return 1
     [[ "$output" == *"SOURCE=Go module cache"* ]] || return 1
     rm -rf "$module_root"
+}
+
+@test "clean_dev_go skips the Go caches when go env times out and keeps a signal sticky" {
+    # `go env` only resolves the roots. A quick-detect timeout leaves them
+    # unknown with nothing deleted, so it skips the Go caches without
+    # cancelling later cleanup; a signal from either lookup still stops the run.
+    local module_root="$HOME/go-resolver-module"
+    local build_root="$HOME/go-resolver-build"
+    local trace="$HOME/go-resolver.trace"
+    mkdir -p "$module_root" "$build_root"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" \
+        GO_MODULE_ROOT="$module_root" GO_BUILD_ROOT="$build_root" GO_TRACE="$trace" \
+        /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/dev.sh"
+DRY_RUN=false
+MOLE_CURRENT_COMMAND=clean
+go() { :; }
+run_with_timeout() {
+    shift
+    if [[ "$1" == "go" && "$2" == "env" ]]; then
+        [[ "$3" == "$RESOLVER_FAIL_KIND" ]] && return "$RESOLVER_FAIL_RC"
+        if [[ "$3" == "GOMODCACHE" ]]; then
+            printf '%s\n' "$GO_MODULE_ROOT"
+        else
+            printf '%s\n' "$GO_BUILD_ROOT"
+        fi
+        return 0
+    fi
+    printf 'CLEAN:%s\n' "$*" >> "$GO_TRACE"
+    return 0
+}
+is_path_whitelisted() { return 1; }
+should_protect_path() { return 1; }
+go_cache_process_state() { return 1; }
+note_activity() { :; }
+later_step() { LATER=ran; }
+
+for scenario in none:0 GOMODCACHE:124 GOCACHE:124 GOMODCACHE:130 GOCACHE:143; do
+    RESOLVER_FAIL_KIND="${scenario%%:*}"
+    RESOLVER_FAIL_RC="${scenario##*:}"
+    MOLE_CLEAN_CANCEL_STATUS=0
+    : > "$GO_TRACE"
+    rc=0
+    _run_developer_cleanup_step clean_dev_go || rc=$?
+    LATER=skipped
+    _run_developer_cleanup_step later_step || true
+    cleans=$(grep -c '^CLEAN:' "$GO_TRACE" || true)
+    printf 'SCENARIO=%s RC=%s CANCEL=%s LATER=%s CLEANS=%s\n' \
+        "$scenario" "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$LATER" "$cleans"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=none:0 RC=0 CANCEL=0 LATER=ran CLEANS=2"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=GOMODCACHE:124 RC=0 CANCEL=0 LATER=ran CLEANS=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=GOCACHE:124 RC=0 CANCEL=0 LATER=ran CLEANS=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=GOMODCACHE:130 RC=130 CANCEL=130 LATER=skipped CLEANS=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"SCENARIO=GOCACHE:143 RC=143 CANCEL=143 LATER=skipped CLEANS=0"* ]] || { echo "$output"; return 1; }
+    rm -rf "$module_root" "$build_root" "$trace" # SAFE: test fixture paths under the temporary HOME
 }
 
 @test "clean_go_cache_root refuses a path replaced before the owner command" {

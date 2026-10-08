@@ -42,8 +42,7 @@ clean_tool_cache() {
         if [[ $command_rc -eq 0 ]]; then
             echo -e "  ${GREEN}${ICON_SUCCESS}${NC} $description"
             note_activity
-        elif ! mole_rc_timeout_or_signal "$command_rc" || mole_rc_timeout "$command_rc" ||
-            ! kill -l "$command_rc" > /dev/null 2>&1; then
+        elif ! mole_rc_signal "$command_rc"; then
             # Routine owner failures stay in diagnostics, without a success
             # row or activity marker. A timeout here skips this one tool, and
             # mole.log names it so a slow tool is not left to guesswork.
@@ -522,11 +521,18 @@ clean_dev_npm() {
             if [[ -t 1 ]]; then
                 start_section_spinner "Cleaning bun cache..."
             fi
-            if run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" bun pm cache rm > /dev/null 2>&1; then
-                bun_cache_cleaned=true
-            fi
+            local bun_rm_rc=0
+            run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" bun pm cache rm > /dev/null 2>&1 || bun_rm_rc=$?
+            [[ $bun_rm_rc -ne 0 ]] || bun_cache_cleaned=true
             if [[ -t 1 ]]; then
                 stop_section_spinner
+            fi
+            if mole_rc_signal "$bun_rm_rc"; then
+                # Ctrl-C while the owner command holds the terminal reaches
+                # only the child: stop instead of removing the cache directly.
+                debug_log "bun cache: owner command interrupted (exit $bun_rm_rc)"
+                _mole_record_clean_cancellation "$bun_rm_rc" "bun cache"
+                return "$bun_rm_rc"
             fi
             if [[ "$bun_cache_cleaned" == "true" ]]; then
                 echo -e "  ${GREEN}${ICON_SUCCESS}${NC} bun cache"
@@ -1002,15 +1008,15 @@ clean_go_cache_root() {
         return 0
     fi
     if mole_rc_timeout "$command_status"; then
-        # Like every other owner command (clean_tool_cache), a timed-out `go
-        # clean` skips this one cache instead of cancelling unrelated cleanup.
+        # A timed-out `go clean` skips this one cache instead of cancelling
+        # unrelated cleanup, as clean_tool_cache does for its owner commands.
         # Go may already have removed part of the root, so say it stopped.
         echo -e "  ${GRAY}${ICON_WARNING}${NC} ${display_name} · stopped (timed out)"
         note_activity
         log_warning_to_file "$display_name timed out after ${MOLE_TIMEOUT_PKG_CLEANUP_SEC}s and was skipped: go clean $clean_flag $physical_root"
         return 0
     fi
-    if mole_rc_timeout_or_signal "$command_status"; then
+    if mole_rc_signal "$command_status"; then
         _mole_record_clean_cancellation "$command_status" "$display_name"
         return "$command_status"
     fi
@@ -1038,12 +1044,20 @@ clean_dev_go() {
     local go_build_cache=""
     local resolver_rc=0
     go_mod_cache=$(mole_go_cache_root GOMODCACHE) || resolver_rc=$?
-    if mole_rc_timeout_or_signal "$resolver_rc"; then
+    # A slow `go env` leaves the roots unknown and nothing was deleted, so it
+    # skips the Go caches only; a signal still stops the run.
+    if mole_rc_timeout "$resolver_rc"; then
+        debug_log "Skipping Go caches: go env GOMODCACHE timed out"
+        return 0
+    elif mole_rc_timeout_or_signal "$resolver_rc"; then
         return "$resolver_rc"
     fi
     resolver_rc=0
     go_build_cache=$(mole_go_cache_root GOCACHE) || resolver_rc=$?
-    if mole_rc_timeout_or_signal "$resolver_rc"; then
+    if mole_rc_timeout "$resolver_rc"; then
+        debug_log "Skipping Go caches: go env GOCACHE timed out"
+        return 0
+    elif mole_rc_timeout_or_signal "$resolver_rc"; then
         return "$resolver_rc"
     fi
 
@@ -2818,6 +2832,12 @@ clean_dev_mobile() {
                             fi
                         else
                             stop_section_spinner
+
+                            if mole_rc_signal "$delete_exit_code"; then
+                                debug_log "simctl delete unavailable interrupted (exit $delete_exit_code)"
+                                _mole_record_clean_cancellation "$delete_exit_code" "Xcode unavailable simulators"
+                                return "$delete_exit_code"
+                            fi
 
                             # Analyze error and provide helpful message
                             local error_hint=""

@@ -1,0 +1,50 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Package (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Build package
+        run: nix build --no-write-lock-file --print-build-logs .#mole
+      - name: Check installed package
+        run: python3 scripts/test_nix_package.py result
+      - name: Check profile install, upgrade and removal
+        run: |
+          set -euo pipefail
+          profile_dir=$(mktemp -d "$RUNNER_TEMP/mole-nix-profile.XXXXXX")
+          cleanup() {
+            rm -rf "$profile_dir" # SAFE: Only this step's private mktemp directory and profile are removed.
+          }
+          trap cleanup EXIT
+          profile="$profile_dir/profile"
+          mkdir "$profile_dir/home"
+          nix profile install --profile "$profile" --no-write-lock-file .#mole
+          nix profile list --profile "$profile" --json | python3 -c 'import json, sys; assert "mole" in json.load(sys.stdin)["elements"]'
+          HOME="$profile_dir/home" MOLE_TEST_NO_AUTH=1 "$profile/bin/mo" --version
+          nix profile upgrade --profile "$profile" --no-write-lock-file mole
+          HOME="$profile_dir/home" MOLE_TEST_NO_AUTH=1 "$profile/bin/mo" --version
+          nix profile remove --profile "$profile" mole
+          test ! -e "$profile/bin/mo" && test ! -L "$profile/bin/mo"
+          test ! -e "$profile/bin/mole" && test ! -L "$profile/bin/mole"

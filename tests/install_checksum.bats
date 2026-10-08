@@ -512,6 +512,38 @@ EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
 
+@test "get_installed_version fallback reads VERSION past a pinned line that is not UTF-8" {
+	# A UTF-8 printf %q pinned non-ASCII config paths as raw lead bytes plus \NNN
+	# escapes. A UTF-8 sed stops at that line, before the VERSION line the
+	# fallback needs. The plain pin is the control.
+	run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+		/bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mole_source_installer
+run_install_probe_with_timeout() { return 124; }
+for name in plain hybrid; do
+	INSTALL_DIR="$HOME/install-$name"
+	mkdir -p "$INSTALL_DIR"
+	{
+		printf '%s\n' '#!/bin/bash'
+		if [[ "$name" == hybrid ]]; then
+			# shellcheck disable=SC2016 # The pinned line is data, not an expansion.
+			printf 'SCRIPT_DIR=$'\''%s/\344\270\\211'\''\n' "$HOME"
+		else
+			printf 'SCRIPT_DIR=%s/config\n' "$HOME"
+		fi
+		printf '%s\n' 'VERSION="1.2.3"'
+	} > "$INSTALL_DIR/mole"
+	chmod +x "$INSTALL_DIR/mole"
+	[[ "$(get_installed_version)" == "1.2.3" ]] || { printf 'NO_VERSION:%s\n' "$name"; exit 1; }
+done
+EOF
+	[ "$status" -eq 0 ] || {
+		echo "$output"
+		return 1
+	}
+}
+
 @test "install_files fails closed when sudo is unavailable, even under || caller (#update-incident)" {
 	# Old moles invoke `install_files || {...}`, which disables errexit inside
 	# the function. Uncached `sudo -n` then failed on every copy while the

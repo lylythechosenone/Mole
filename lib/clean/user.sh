@@ -67,9 +67,16 @@ clean_trash() {
                 local trash_item_kb
                 local size_rc=0
                 trash_item_kb=$(get_path_size_kb "$trash_item" 2> /dev/null) || size_rc=$?
-                [[ $size_rc -eq 0 ]] || _mole_record_clean_cancellation "$size_rc"
-                [[ $size_rc -eq 0 ]] || return "$size_rc"
-                [[ "$trash_item_kb" =~ ^[0-9]+$ ]] || trash_item_kb=0
+                # The real run empties an item whose sizing timed out or
+                # failed, so the preview lists it with an unknown size instead
+                # of dropping it or cancelling the later sections. A signal
+                # still cancels.
+                mole_item_size_continues "$size_rc" || return $?
+                local trash_size_known=true
+                [[ $size_rc -eq 0 && "$trash_item_kb" =~ ^[0-9]+$ ]] || {
+                    trash_item_kb=0
+                    trash_size_known=false
+                }
                 if (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
                     holds_compiled_model_cache "$trash_item" 2> /dev/null); then
                     continue
@@ -87,7 +94,7 @@ clean_trash() {
                 [[ $validate_rc -eq 0 ]] || continue
                 if declare -f record_dry_run_cleanup_target > /dev/null 2>&1; then
                     local _MOLE_DRY_RUN_TARGET_PREVALIDATED=true
-                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 true || continue
+                    record_dry_run_cleanup_target "$trash_item" "$trash_item_kb" 1 "$trash_size_known" || continue
                 fi
                 preview_count=$((preview_count + 1))
             done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
@@ -2168,6 +2175,7 @@ clean_tart_caches() {
         start_section_spinner "Pruning Tart caches..."
     fi
     local prune_succeeded=false
+    local prune_rc=0
     tart_state=0
     mole_pgrep_any -x "tart" || tart_state=$?
     if [[ $tart_state -ne 1 ]]; then
@@ -2181,9 +2189,17 @@ clean_tart_caches() {
         return 0
     elif run_with_timeout "$MOLE_TIMEOUT_PKG_CLEANUP_SEC" tart prune --entries caches --older-than "$MOLE_ORPHAN_AGE_DAYS" > /dev/null 2>&1; then
         prune_succeeded=true
+    else
+        prune_rc=$?
     fi
     if [[ -t 1 ]]; then
         stop_section_spinner
+    fi
+    if mole_rc_signal "$prune_rc"; then
+        # Ctrl-C while tart holds the terminal reaches only the child.
+        debug_log "Tart caches: owner command interrupted (exit $prune_rc)"
+        _mole_record_clean_cancellation "$prune_rc" "Tart caches"
+        return "$prune_rc"
     fi
 
     if [[ "$prune_succeeded" != "true" ]]; then
@@ -2837,6 +2853,8 @@ _large_prefetch_queue_rows() {
     [[ "${MISE_DATA_DIR:-}" == /* ]] && mise_installs="$MISE_DATA_DIR/installs"
     local fvm_versions="$HOME/fvm/versions"
     [[ "${FVM_CACHE_PATH:-}" == /* ]] && fvm_versions="$FVM_CACHE_PATH/versions"
+    local deno_module_cache=""
+    deno_module_cache=$(mole_deno_cache_root 2> /dev/null) || deno_module_cache=""
     local path
     for path in \
         "$HOME/Library/Developer/Xcode/DerivedData" \
@@ -2854,6 +2872,7 @@ _large_prefetch_queue_rows() {
         "$HOME/.m2/repository" \
         "$HOME/.ivy2/cache" \
         "$HOME/.nuget/packages" \
+        "$deno_module_cache" \
         "$HOME/Library/pnpm/store" \
         "$HOME/.conda/pkgs" \
         "$HOME/anaconda3/pkgs" \

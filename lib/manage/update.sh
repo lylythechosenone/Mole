@@ -592,10 +592,6 @@ run_brew_detect() {
     run_brew_command "${MOLE_HOMEBREW_DETECT_TIMEOUT:-2}" "$@"
 }
 
-run_brew_query() {
-    run_brew_command "${MOLE_HOMEBREW_QUERY_TIMEOUT:-5}" "$@"
-}
-
 brew_mole_formula_installed() {
     local brew_cmd="${1:-brew}"
     run_brew_detect "$brew_cmd" list mole > /dev/null 2>&1
@@ -701,46 +697,10 @@ is_homebrew_install() {
     is_homebrew_mole_path "$mole_path" "$has_brew"
 }
 
-is_nix_mole_path() {
-    local mole_path="$1"
-    local store_dir="${NIX_STORE_DIR:-${NIX_STORE:-/nix/store}}"
-    store_dir="${store_dir%/}"
-    [[ -n "$mole_path" ]] || return 1
-
-    if [[ "$mole_path" == *"$store_dir/"* || "$mole_path" == *"/nix/store/"* ]]; then
-        return 0
-    fi
-
-    local target="$mole_path"
-    local hops=0
-    while [[ -L "$target" && $hops -lt 16 ]]; do
-        hops=$((hops + 1))
-        local dir
-        dir="$(dirname "$target")"
-        target="$(readlink "$target" 2> /dev/null || true)"
-        [[ "$target" != /* ]] && target="$dir/$target"
-        if [[ "$target" == *"$store_dir/"* || "$target" == *"/nix/store/"* ]]; then
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-# Install detection (Nix).
+# SCRIPT_DIR is resolved by the launcher before these helpers are loaded.
+# Match the store root, not a coincidental directory named nix/store in HOME.
 is_nix_install() {
-    [[ "${MOLE_NIX_INSTALL:-0}" == "1" ]] && return 0
-
-    local store_dir="${NIX_STORE_DIR:-${NIX_STORE:-/nix/store}}"
-    store_dir="${store_dir%/}"
-    if [[ "${SCRIPT_DIR:-}" == *"$store_dir/"* || "${SCRIPT_DIR:-}" == *"/nix/store/"* ||
-        "${SCRIPT_PATH:-}" == *"$store_dir/"* || "${SCRIPT_PATH:-}" == *"/nix/store/"* ]]; then
-        return 0
-    fi
-
-    local mole_path
-    mole_path=$(resolve_mole_source_path || true)
-    is_nix_mole_path "$mole_path"
+    [[ "${SCRIPT_DIR:-}" == /nix/store/* ]]
 }
 
 get_install_channel() {
@@ -868,20 +828,37 @@ mole_update_message_cache_is_current() {
     return 0
 }
 
+# A notice that offers this install's own version, or an older one, is already
+# satisfied. Package managers keep file mtimes across an upgrade, so a notice
+# left behind by the previous release passes the mtime check above and would
+# otherwise tell the user to update to the version they are running.
+mole_update_message_is_stale() {
+    local message="$1" pattern='Update ([0-9]+\.[0-9]+\.[0-9]+) available' offered
+    [[ -n "${VERSION:-}" && "$message" =~ $pattern ]] || return 1
+    offered="${BASH_REMATCH[1]}"
+    [[ "$offered" == "$VERSION" ]] && return 0
+    [[ "$(printf '%s\n' "$VERSION" "$offered" | sort -V | head -1)" != "$VERSION" ]]
+}
+
 read_update_message_cache() {
-    local msg_cache="$1"
+    local msg_cache="$1" message=""
+    is_nix_install && return 0
     if mole_update_message_cache_is_current "$msg_cache"; then
-        cat "$msg_cache" 2> /dev/null || echo ""
-    else
-        echo ""
+        message=$(cat "$msg_cache" 2> /dev/null) || message=""
+        if mole_update_message_is_stale "$message"; then
+            message=""
+        fi
     fi
+    printf '%s\n' "$message"
 }
 
 # Cache writes are atomic so the menu never reads a partially written notice.
 _mole_write_update_cache() {
     local path="$1" value="$2" scratch
-    scratch=$(umask 077 && mktemp "${path}.XXXXXX") || return 1
-    if printf '%s' "$value" > "$scratch" && mv -f "$scratch" "$path"; then
+    # An unwritable cache must stay as quiet as the lookup, so every probe here
+    # keeps its diagnostics off the terminal.
+    scratch=$(umask 077 && mktemp "${path}.XXXXXX" 2> /dev/null) || return 1
+    if printf '%s' "$value" > "$scratch" 2> /dev/null && mv -f "$scratch" "$path" 2> /dev/null; then
         return 0
     fi
     rm -f "$scratch" # SAFE: exact mktemp-created update cache scratch file
@@ -889,19 +866,20 @@ _mole_write_update_cache() {
 }
 
 # One successful lookup per day; unknown results retry after an hour.
-# Bind the throttle to the install version, channel, commit and entrypoint.
+# Bind the throttle to the install version, channel, commit and install
+# directory. The invoked name (mo, mole, a symlink) is not part of the key, so
+# every way of starting one install shares a single lookup and notice.
 check_for_updates() {
     local cache_dir="$HOME/.cache/mole" channel key now saved_key="" checked=0 interval=0
-    if is_nix_install; then
-        [[ -f "$cache_dir/update_message" ]] && : > "$cache_dir/update_message" 2> /dev/null || true
-        return 0
-    fi
+    is_nix_install && return 0
     ensure_user_dir "$cache_dir" || return 0
-    channel=$(get_install_channel)
-    key=$(printf '%s\n' "$VERSION" "$channel" "$(get_install_commit)" "${MOLE_ENTRY_SCRIPT:-${SCRIPT_DIR:-}}" | cksum | awk '{print $1}')
+    # The receipt probes run in the foreground now, so an unreadable receipt
+    # must not print sed's diagnostic before the user's command.
+    channel=$(get_install_channel 2> /dev/null)
+    key=$(printf '%s\n' "$VERSION" "$channel" "$(get_install_commit 2> /dev/null)" "${SCRIPT_DIR:-}" | cksum | awk '{print $1}')
     now=$(date +%s)
     if [[ -f "$cache_dir/version_check" ]]; then
-        read -r saved_key checked interval < "$cache_dir/version_check" || true
+        { read -r saved_key checked interval < "$cache_dir/version_check"; } 2> /dev/null || true
         if [[ "$saved_key" == "$key" && "$checked" =~ ^[0-9]{1,12}$ && "$interval" =~ ^(3600|86400)$ ]] &&
             ((now >= 10#$checked && now - 10#$checked < interval)); then
             return 0
@@ -952,21 +930,47 @@ run_mole_command() {
             --json | -json | --json=* | -json=* | --ndjson | --watch | -watch | --watch=* | -watch=* | --help | -h | --version | -V | --list | --list=*) exec "$@" ;;
         esac
     done
+    # Without perl, or with a target bash cannot launch (missing, not
+    # executable, or a #! line naming a missing interpreter), run the plain
+    # exec: bash then prints its own error and returns its own status, exactly
+    # as a redirected run does, and only the notice is lost.
+    [[ -x /usr/bin/perl && -f "$1" && -x "$1" ]] || exec "$@"
+    local shebang=""
+    { IFS= read -r shebang < "$1"; } 2> /dev/null || true
+    if [[ "$shebang" == '#!'* ]]; then
+        shebang=${shebang#'#!'}
+        shebang=${shebang# }
+        shebang=${shebang%% *}
+        [[ -x "$shebang" ]] || exec "$@"
+    fi
     check_for_updates
     local command_pid interrupted=0 signal_generation=0 observed_generation=0
     # Bash ignores SIGINT in asynchronous jobs. Restore the normal disposition
     # before exec so both terminal Ctrl-C and signals sent to this router work.
-    /usr/bin/perl -e '$SIG{INT}="DEFAULT"; $SIG{QUIT}="DEFAULT"; exec {$ARGV[0]} @ARGV; exit 127' "$@" <&0 &
+    # The checks above leave no known reason for the exec to fail; if one
+    # appears anyway the cause is reported and the status is 1, like the plain
+    # exec.
+    /usr/bin/perl -e '$SIG{INT}="DEFAULT"; $SIG{QUIT}="DEFAULT"; exec {$ARGV[0]} @ARGV; warn "$ARGV[0]: $!\n"; exit 1' "$@" <&0 &
     command_pid=$!
+    # A terminal Ctrl-C signals the whole foreground group, which holds this
+    # router and the child, and the forward below then signals the child again.
+    # Bash cannot tell that from a kill sent to the router alone, so on a
+    # terminal the child may see INT twice and otherwise once: command INT
+    # handlers must tolerate a repeat. tests/main_menu_pty.py counts both.
     trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=129; kill -HUP "$command_pid" 2>/dev/null || true' HUP
     trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=130; kill -INT "$command_pid" 2>/dev/null || true' INT
     trap 'signal_generation=$((signal_generation + 1)); [[ "$interrupted" -ne 0 ]] || interrupted=143; kill -TERM "$command_pid" 2>/dev/null || true' TERM
     # wait returns early for a trapped signal. Retry only when this wait was
     # interrupted, retaining the first cancellation status through child cleanup.
+    # Its stderr is dropped because bash reports a child killed by a signal
+    # (SIGKILL, a crash) with a job-status line that quotes the perl one-liner;
+    # the exit status is unaffected. The redirect sits on a group, not on the
+    # wait builtin: on bash 3.2 a TERM or HUP trap followed within a fraction
+    # of a millisecond by INT can leave a redirected wait looping at full CPU.
     while true; do
         observed_generation=$signal_generation
         rc=0
-        wait "$command_pid" || rc=$?
+        { wait "$command_pid"; } 2> /dev/null || rc=$?
         [[ "$observed_generation" -eq "$signal_generation" ]] && break
     done
     [[ "$interrupted" -eq 0 ]] || rc=$interrupted
@@ -1109,7 +1113,7 @@ update_mole() (
     if is_nix_install; then
         local review_icon="${ICON_REVIEW:-⊙}"
         log_error "Mole was installed via Nix. Self-update is disabled."
-        printf '%s To update Mole: nix profile upgrade mole, nix flake update, or update your Nix configuration\n' "$review_icon"
+        printf '%s To update Mole: nix profile upgrade mole, or update the Mole input in your Nix configuration\n' "$review_icon"
         exit 1
     fi
 

@@ -21,9 +21,14 @@ teardown_file() {
 # plain "drop the timeout and run it" wrapper mock removes the production
 # bound as well. Each test then walked the host's real temp tree twice,
 # unbounded, for seconds. Intercept at the wrapper instead and hand back an
-# empty result, the same seam the code_sign_clone and GPU-cache tests below
-# already use to inject their fixtures.
+# empty result, the same seam the GPU-cache tests below use to inject their
+# fixtures. The browser clone stage reads the host's per-user temp dir (by
+# uid, not HOME) with the real ps, lsof and safe_remove, so tests that do not
+# exercise it run with the stage stubbed; tests/browser_clones.bats covers it
+# against fixtures. A test with its own run_with_timeout stubs it by hand.
 mock_run_with_timeout_skipping_var_folders() {
+    # shellcheck disable=SC2329  # Invoked by lib/clean/system.sh once defined.
+    clean_browser_code_sign_clones() { :; }
     # shellcheck disable=SC2329  # Invoked by lib/clean/system.sh once defined.
     run_with_timeout() {
         shift
@@ -482,6 +487,7 @@ stop_section_spinner() { :; }
 get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 0; }
 find() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
@@ -543,6 +549,7 @@ stop_section_spinner() { :; }
 get_file_mtime() { echo 0; }
 get_path_size_kb() { echo 0; }
 find() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
@@ -772,6 +779,66 @@ EOF
     [[ "$output" == *"timed out"* ]] || { echo "$output"; return 1; }
 }
 
+@test "clean_homebrew stops on an interrupted cleanup after restoring active links" {
+    # Ctrl-C while `brew cleanup` holds the terminal reaches only the child.
+    # A signal stops the run once the active links are back; a plain failure
+    # or a timeout leaves the stamp unset and carries on to the autoremove
+    # preview.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_CURRENT_COMMAND=clean \
+        /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/brew.sh"
+
+TEST_BREW_PREFIX="$HOME/homebrew-interrupt"
+TEST_BREW_CELLAR="$TEST_BREW_PREFIX/Cellar"
+TEST_TRACE="$HOME/homebrew-interrupt.trace"
+mkdir -p "$TEST_BREW_PREFIX/bin" "$TEST_BREW_CELLAR/node/26.4.0/bin" "$HOME/Library/Caches/Homebrew" "$HOME/.cache/mole"
+printf '#!/bin/sh\n' > "$TEST_BREW_CELLAR/node/26.4.0/bin/node"
+
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+ensure_user_file() { mkdir -p "$(dirname "$1")"; : > "$1"; }
+run_with_timeout() { shift; "$@"; }
+brew() {
+    case "$*" in
+        --prefix) printf '%s\n' "$TEST_BREW_PREFIX" ;;
+        --cellar) printf '%s\n' "$TEST_BREW_CELLAR" ;;
+        "cleanup --prune=30")
+            rm -f "$TEST_BREW_PREFIX/bin/node"
+            return "$BREW_CLEANUP_RC"
+            ;;
+        "autoremove --dry-run") echo autoremove >> "$TEST_TRACE" ;;
+        *) return 0 ;;
+    esac
+}
+
+for BREW_CLEANUP_RC in 130 143 1 124; do
+    rm -f "$HOME/.cache/mole/brew_last_cleanup" "$TEST_TRACE" "$TEST_BREW_PREFIX/bin/node"
+    : > "$TEST_TRACE"
+    ln -s ../Cellar/node/26.4.0/bin/node "$TEST_BREW_PREFIX/bin/node"
+    MOLE_CLEAN_CANCEL_STATUS=0
+    rc=0
+    clean_homebrew > /dev/null || rc=$?
+    restored=no
+    [[ -L "$TEST_BREW_PREFIX/bin/node" ]] && restored=yes
+    stamped=no
+    [[ -e "$HOME/.cache/mole/brew_last_cleanup" ]] && stamped=yes
+    printf 'BREW=%s RC=%s CANCEL=%s RESTORED=%s STAMPED=%s AUTOREMOVE=%s\n' \
+        "$BREW_CLEANUP_RC" "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$restored" "$stamped" \
+        "$(grep -c '^autoremove$' "$TEST_TRACE" || true)"
+done
+EOF
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=130 RC=130 CANCEL=130 RESTORED=yes STAMPED=no AUTOREMOVE=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=143 RC=143 CANCEL=143 RESTORED=yes STAMPED=no AUTOREMOVE=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=1 RC=0 CANCEL=0 RESTORED=yes STAMPED=no AUTOREMOVE=1"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"BREW=124 RC=0 CANCEL=0 RESTORED=yes STAMPED=no AUTOREMOVE=1"* ]] || { echo "$output"; return 1; }
+}
+
 @test "clean_homebrew prevents cleanup from implicitly autoremoving formulae" {
     run /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
@@ -972,7 +1039,7 @@ brew() {
 }
 
 clean_homebrew
-[[ ! -e "$TEST_BREW_PREFIX/bin/node" && ! -L "$TEST_BREW_PREFIX/bin/node" ]]
+[[ ! -e "$TEST_BREW_PREFIX/bin/node" && ! -L "$TEST_BREW_PREFIX/bin/node" ]] || exit 1
 [[ -f "$external_target" ]]
 EOF
 
@@ -1417,7 +1484,8 @@ EOF
 }
 
 @test "clean_deep_system memory exception respects DRY_RUN flag" {
-    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true /bin/bash --noprofile --norc << 'EOF'
+    # bin/clean.sh --dry-run sets both; safe_remove honours only MOLE_DRY_RUN.
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true MOLE_DRY_RUN=1 /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
 CALL_LOG="$HOME/memory_exception_dryrun_calls.log"
 > "$CALL_LOG"
@@ -1799,13 +1867,12 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
 gpu_cache_dir_is_stale() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift
-    # Answer only the GPU-cache scan. Matching on the bare "find /private/var/folders"
-    # prefix also swallowed the code_sign_clone sweep, which then received this GPU
-    # list and removed every entry in it, including the /T/ path this test asserts is
-    # never touched.
+    # Answer only the GPU-cache scan, which is the one carrying the com.apple.metal
+    # pattern; any other /private/var/folders find must not receive this list.
     if [[ "${1:-}" == "/usr/bin/find" && "${2:-}" == "/private/var/folders" && "$*" == *"com.apple.metal"* ]]; then
         printf 'find_args:%s\n' "$*" >> "$CALL_LOG"
         printf '%s\0' \
@@ -1857,6 +1924,7 @@ start_section_spinner() { :; }
 stop_section_spinner() { :; }
 find() { return 0; }
 gpu_cache_dir_is_stale() { return 0; }
+clean_browser_code_sign_clones() { :; }
 run_with_timeout() {
     local _timeout="$1"
     shift

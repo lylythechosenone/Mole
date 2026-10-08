@@ -76,35 +76,6 @@ append_log_lines() {
     fi
 }
 
-# Escape operation records and deletion-log fields at their write boundaries.
-# Control bytes must never create audit records or terminal controls.
-# Only the logged copy changes, never the action path.
-_mole_escape_log_value() {
-    local _output="$1" _value="$2" _escaped="" _char _code _index
-    local LC_ALL=C
-    _value="${_value//\\/\\\\}"
-    if [[ "$_value" =~ [[:cntrl:]] ]]; then
-        for ((_index = 0; _index < ${#_value}; _index++)); do
-            _char="${_value:_index:1}"
-            case "$_char" in
-                $'\n') _escaped+='\n' ;;
-                $'\r') _escaped+='\r' ;;
-                $'\t') _escaped+='\t' ;;
-                *)
-                    if [[ "$_char" =~ [[:cntrl:]] ]]; then
-                        printf -v _code '\\x%02x' "'$_char"
-                        _escaped+="$_code"
-                    else
-                        _escaped+="$_char"
-                    fi
-                    ;;
-            esac
-        done
-        _value="$_escaped"
-    fi
-    printf -v "$_output" '%s' "$_value"
-}
-
 # Rotate log file if it exceeds maximum size
 rotate_log_once() {
     # Skip if already checked this session

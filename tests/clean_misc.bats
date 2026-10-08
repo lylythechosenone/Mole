@@ -135,6 +135,52 @@ EOF
     [[ "$output" != *"--entries vms"* ]] || return 1
 }
 
+@test "clean_tart_caches stops when the native prune is interrupted" {
+    # Ctrl-C while `tart prune` holds the terminal reaches only the child. A
+    # signal stops cleanup before the size recount; a plain failure or a
+    # timeout is a reported prune failure and cleanup continues.
+    local prune_status case_home
+    for prune_status in 130 143 1 124; do
+        case_home="$HOME/tart-prune-$prune_status"
+        mkdir -p "$case_home/.tart/cache/OCIs"
+        rm -f "$case_home/size-calls" # SAFE: test scratch file under the temporary HOME
+
+        run env HOME="$case_home" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=false \
+            MOLE_CURRENT_COMMAND=clean MOLE_CLEAN_CANCEL_STATUS=0 PRUNE_STATUS="$prune_status" \
+            /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+note_activity() { :; }
+debug_log() { :; }
+pgrep() { return 1; }
+is_path_whitelisted() { return 1; }
+get_path_size_kb() { echo size >> "$HOME/size-calls"; echo 4096; }
+bytes_to_human() { echo "$1 bytes"; }
+run_with_timeout() { shift; "$@"; }
+tart() { return "$PRUNE_STATUS"; }
+rc=0
+clean_tart_caches || rc=$?
+size_calls=$(wc -l < "$HOME/size-calls" | tr -d ' ')
+printf 'RC=%s CANCEL=%s SIZE_CALLS=%s\n' "$rc" "$MOLE_CLEAN_CANCEL_STATUS" "$size_calls"
+EOF
+
+        [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+        case "$prune_status" in
+            130 | 143)
+                [[ "$output" == *"RC=$prune_status CANCEL=$prune_status SIZE_CALLS=1"* ]] || { echo "$output"; return 1; }
+                [[ "$output" != *"prune failed"* ]] || { echo "$output"; return 1; }
+                ;;
+            *)
+                [[ "$output" == *"RC=0 CANCEL=0 SIZE_CALLS=1"* ]] || { echo "$output"; return 1; }
+                [[ "$output" == *"Tart caches · prune failed"* ]] || { echo "$output"; return 1; }
+                ;;
+        esac
+    done
+}
+
 @test "clean_tart_caches dry-run shows size, policy, and exact command without execution" {
     rm -rf "$HOME/.tart" "$HOME/tart-called"
     mkdir -p "$HOME/.tart/cache/IPSWs"

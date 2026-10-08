@@ -449,3 +449,20 @@ _tty_bg_field() {
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
     [[ "$output" == "0:no:no 1:no:no 2:no:no 123:no:no 124:yes:yes 125:no:no 127:no:no 128:no:yes 130:no:yes 143:no:yes empty:no:no " ]]
 }
+
+@test "mole_rc_signal accepts only statuses that name a real signal" {
+    # An owner command may exit with an errno-derived status above 127 (npm's
+    # 243, for one). That is an ordinary failure, and a timeout is not a signal.
+    run /bin/bash --noprofile --norc -c '
+        set -euo pipefail
+        source "$1/lib/core/timeout.sh"
+        for rc in 0 1 124 127 128 129 130 143 159 160 192 243 255 ""; do
+            a=no
+            mole_rc_signal "$rc" && a=yes
+            printf "%s:%s " "${rc:-empty}" "$a"
+        done
+    ' _ "${BATS_TEST_DIRNAME}/.."
+
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == "0:no 1:no 124:no 127:no 128:no 129:yes 130:yes 143:yes 159:yes 160:no 192:no 243:no 255:no empty:no " ]]
+}

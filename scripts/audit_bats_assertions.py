@@ -3,16 +3,18 @@
 
 Bats runs test bodies under `set -e`, but bash 3.2, which is /bin/bash on
 macOS and what `env bash` resolves to there, does not trigger errexit for a
-failing `[[ ]]`. Only the last statement's status decides the test, so a bare
-`[[ ]]` anywhere before it asserts nothing.
+failing `[[ ]]` or a failing `(( ))` comparison. Only the last statement's
+status decides the test, so a bare `[[ ]]` or `(( a < b ))` anywhere before it
+asserts nothing. A `(( n++ ))` without a comparison is arithmetic, not an
+assertion, and is left alone.
 
 A `!`-negated pipeline never triggers errexit in any bash, so a bare `! cmd`
-before the last statement asserts nothing either. That rule also covers the
-body of a heredoc fed to a shell (`run bash <<'EOF'`), which is judged only by
-its own last statement. Function bodies are mocks rather than assertions, and
-other heredocs are data, so both are skipped. The bare `[[ ]]` rule still
-skips heredoc bodies. A statement runs across line continuations and open
-quotes, so a multi-line `bash -c "..."` script is one statement of its test.
+before the last statement asserts nothing either. All three rules also cover
+the body of a heredoc fed to a shell (`run bash <<'EOF'`), which is judged only
+by its own last statement. Function bodies are mocks rather than assertions,
+and other heredocs are data, so both are skipped. A statement runs across line
+continuations and open quotes, so a multi-line `bash -c "..."` script is one
+statement of its test.
 """
 
 from __future__ import annotations
@@ -28,10 +30,21 @@ HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 FUNCTION_START = re.compile(r"^(?:function\s+)?[A-Za-z_][A-Za-z0-9_:.-]*\s*\(\)\s*\{")
 SHELL_COMMAND = re.compile(r"(?:^|[\s/=(])(?:ba)?sh(?:\s|$)")
 CONTINUATION = ("\\", "|", "&&")
+# A comparison, not a shift (`<<`, `>>`, `<<=`, `>>=`): `(( n++ ))`, `(( n += 1 ))`
+# and `(( n <<= 1 ))` only compute.
+ARITHMETIC_COMPARISON = re.compile(r"==|!=|(?<![<>])<=|(?<![<>])>=|(?<![<>])[<>](?![<>=])")
 
 
 def is_bare_assertion(statement: str) -> bool:
     return statement.startswith("[[") and statement.endswith("]]")
+
+
+def is_bare_arithmetic(statement: str) -> bool:
+    return (
+        statement.startswith("((")
+        and statement.endswith("))")
+        and ARITHMETIC_COMPARISON.search(statement) is not None
+    )
 
 
 def is_bare_negation(statement: str) -> bool:
@@ -104,8 +117,8 @@ class Body:
     def findings(self) -> list[tuple[int, str]]:
         earlier = self.statements[:-1]
         found = [(line, "negation") for line, text in earlier if is_bare_negation(text)]
-        if not self.shell_heredoc:
-            found += [(line, "bracket") for line, text in earlier if is_bare_assertion(text)]
+        found += [(line, "bracket") for line, text in earlier if is_bare_assertion(text)]
+        found += [(line, "arithmetic") for line, text in earlier if is_bare_arithmetic(text)]
         return found
 
     def feed(self, number: int, raw: str, findings: list[tuple[int, str]]) -> None:
@@ -180,7 +193,8 @@ def inspect_file(path: Path) -> list[tuple[int, str]]:
 
 
 MESSAGES = {
-    "bracket": "bare [[ ]] before the last statement never fails on bash 3.2; append '|| return 1'",
+    "bracket": "bare [[ ]] before the last statement never fails on bash 3.2; append '|| return 1', or '|| exit 1' in a heredoc script",
+    "arithmetic": "bare (( )) comparison before the last statement never fails on bash 3.2; append '|| return 1', or '|| exit 1' in a heredoc script",
     "unparsed": "the previous test never closed; an unbalanced quote, heredoc, or function body hid it from this audit",
     "negation": "bare '! cmd' before the last statement never fails; append '|| return 1', or '|| exit 1' in a heredoc script",
 }

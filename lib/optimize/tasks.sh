@@ -199,6 +199,7 @@ opt_system_maintenance() {
     flush_dns_cache || dns_status=$?
     case "$dns_status" in
         0) opt_msg "DNS cache flushed" ;;
+        1) echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to refresh DNS cache" ;;
         2) opt_msg "DNS cache flush skipped, active VPN detected" ;;
         3) echo -e "  ${YELLOW}${ICON_WARNING}${NC} Failed to inspect active VPN state" ;;
     esac

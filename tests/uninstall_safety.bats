@@ -991,6 +991,35 @@ EOF
 	[[ "${lines[${#lines[@]} - 1]}" == "calls=0" ]]
 }
 
+@test "uninstall mode matches the Apple uninstallable globs before the critical rows" {
+	# With the shipped lists no bundle ID is in both APPLE_UNINSTALLABLE_APPS
+	# and SYSTEM_CRITICAL_BUNDLES, so the first loop's verdict equals the
+	# fall-through and quoting its right-hand side would change nothing
+	# observable. A fixture critical row that overlaps com.apple.dt.* makes the
+	# order visible: the unquoted glob wins and Xcode stays uninstallable,
+	# while a quoted one is an exact string, misses, and lets the critical
+	# row protect it.
+	local fixture="$HOME/protection-order-fixture"
+	mkdir -p "$fixture"
+	cp -R "$PROJECT_ROOT/lib" "$PROJECT_ROOT/bin" "$fixture/"
+	awk '{ print } /^readonly SYSTEM_CRITICAL_BUNDLES=\($/ { print "    \"com.apple.dt.*\""; print "    \"org.example.critical.*\"" }' \
+		"$PROJECT_ROOT/lib/core/app_protection_data.sh" >"$fixture/lib/core/app_protection_data.sh"
+
+	run env HOME="$HOME" FIXTURE="$fixture" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+source "$FIXTURE/lib/core/common.sh"
+verdict() { if "$@"; then echo "$*=protected"; else echo "$*=open"; fi; }
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "org.example.critical.Tool"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "com.apple.dt.Xcode"
+MOLE_UNINSTALL_MODE=1 verdict should_protect_path "com.apple.finder"
+EOF
+	[ "$status" -eq 0 ] || return 1
+	# Positive controls: the fixture row is live in uninstall mode, and a
+	# critical ID outside the uninstallable list is still protected.
+	[[ "$output" == *"should_protect_path org.example.critical.Tool=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_path com.apple.finder=protected"* ]] || return 1
+	[[ "$output" == *"should_protect_path com.apple.dt.Xcode=open"* ]]
+}
+
 @test "live uninstall inventory treats independent longer bundle IDs as shared owners" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
 set -euo pipefail
@@ -1153,4 +1182,154 @@ remove_file_list "$data" false com.example.Target "$app" || rc=$?
 [[ ! -e "$HOME/forbidden" && $rc -eq 16 ]] || exit 1
 EOF
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "sibling matching folds case in-process instead of forking per candidate" {
+    # The predicate runs once per installed app in every sibling scan, three
+    # scans per selected app. Two tr forks per id and per name made a
+    # 200-app Mac 2.6x slower than V1.58.0; the verdicts must stay identical.
+    local shim="$BATS_TEST_TMPDIR/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # The shim expands $TR_COUNT_FILE and "$@" when it runs.
+    printf '#!/bin/bash\nprintf . >> "$TR_COUNT_FILE"\nexec /usr/bin/tr "$@"\n' > "$shim/tr"
+    chmod +x "$shim/tr"
+    run env HOME="$BATS_TEST_TMPDIR/home" PATH="$shim:$PATH" \
+        TR_COUNT_FILE="$BATS_TEST_TMPDIR/tr-count" PROJECT_ROOT="$PROJECT_ROOT" \
+        MOLE_TEST_NO_AUTH=1 /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/Selected.app"
+mkdir -p "$selected/Contents"
+apps_data=()
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    app="$HOME/Applications/Vendor$i Tool.app"
+    mkdir -p "$app/Contents"
+    printf '<plist><dict><key>CFBundleIdentifier</key><string>com.Vendor%s.Tool</string></dict></plist>\n' "$i" > "$app/Contents/Info.plist"
+    apps_data+=("$i|$app|Vendor$i Tool|com.Vendor$i.Tool|0|Never|0")
+done
+verdict() { if uninstall_bundles_share_remnants "$2" "$3" "$4" "$5"; then echo "$1=shared"; else echo "$1=open"; fi; }
+: > "$TR_COUNT_FILE"
+verdict dot_continuation_any_case com.Foo.Bar com.foo.bar.PRO /A/Foo.app /A/Other.app
+verdict same_id_any_case com.Foo.Bar COM.FOO.BAR /A/Foo.app /A/Other.app
+verdict channel_name_any_case com.a.x com.b.y "/A/Zed Nightly.app" /A/ZED.app
+verdict suffix_strip_is_case_sensitive com.a.x com.b.y "/A/Zed nightly.app" /A/Zed.app
+verdict unrelated com.a.x com.b.y /A/Alpha.app /A/Beta.app
+verdict one_letter_names com.a.x com.b.y /A/X.app /A/x.app
+rc=0
+uninstall_live_bundle_has_other_install com.example.selected "$selected" || rc=$?
+echo "scan_rc=$rc"
+rc=0
+uninstall_bundle_id_has_surviving_sibling com.Example.Selected "$selected" || rc=$?
+echo "rows_rc=$rc"
+echo "names=[$(uninstall_surviving_sibling_names com.example.selected "$selected")]"
+forks=$(wc -c < "$TR_COUNT_FILE")
+echo "tr_execs=${forks//[[:space:]]/}"
+# Positive control: the same harness still finds a real sibling.
+mkdir -p "$HOME/Applications/Selected Pro.app/Contents"
+printf '<plist><dict><key>CFBundleIdentifier</key><string>com.example.selected.pro</string></dict></plist>\n' > "$HOME/Applications/Selected Pro.app/Contents/Info.plist"
+rc=0
+uninstall_live_bundle_has_other_install com.example.selected "$selected" || rc=$?
+echo "scan_with_sibling_rc=$rc"
+EOF
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"dot_continuation_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"same_id_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"channel_name_any_case=shared"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"suffix_strip_is_case_sensitive=open"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"unrelated=open"* && "$output" == *"one_letter_names=open"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"scan_rc=1"* && "$output" == *"rows_rc=1"* && "$output" == *"names=[]"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"scan_with_sibling_rc=0"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"tr_execs=0"* ]] || { echo "$output"; return 1; }
+}
+
+@test "a retained leftover family names its cause once instead of per path" {
+    # After the app is already in the Trash the user cannot select it again,
+    # so the summary has to say why the data stayed. Three causes can retain a
+    # family: a live sibling, an inventory that could not prove absence, and a
+    # replacement at the selected path. Each gets its own label, once.
+    local scenario label
+    for scenario in shared unknown reappeared single; do
+        run env HOME="$BATS_TEST_TMPDIR/home-$scenario" PROJECT_ROOT="$PROJECT_ROOT" \
+            SCENARIO="$scenario" MOLE_TEST_NO_AUTH=1 MOLE_UNINSTALL_MODE=1 \
+            MOLE_DELETE_MODE=trash /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+mkdir -p "$HOME"
+source "$PROJECT_ROOT/lib/uninstall/batch.sh"
+run_with_timeout() { shift; "$@"; }
+pkg_receipt_nonstandard_app_paths() { :; }
+_MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/Applications")
+_MOLE_UNINSTALL_LIVE_VOLUMES_ROOT="$HOME/no-volumes"
+selected="$HOME/Applications/IntelliJ IDEA.app"
+other="$HOME/Applications/Community.app"
+support="$HOME/Library/Application Support/IntelliJ"
+cache="$HOME/Library/Caches/com.jetbrains.intellij"
+prefs="$HOME/Library/Preferences/com.jetbrains.intellij.plist"
+mkdir -p "$selected/Contents" "$support" "$cache" "${prefs%/*}"
+printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij</string></dict></plist>' > "$selected/Contents/Info.plist"
+printf 'state\n' > "$support/state"
+printf 'cache\n' > "$cache/blob"
+printf 'prefs\n' > "$prefs"
+if [[ "$SCENARIO" == single ]]; then
+    planned=("$support")
+else
+    planned=("$support" "$cache" "$prefs")
+fi
+# Retained bytes are subtracted from the plan, so size the plan up front.
+retained_kb=$(du -skcP "${planned[@]}" | awk 'END {print $1}')
+encoded=$(printf '%s\n' "${planned[@]}" | base64 | tr -d '\n')
+fields=(IDEA "$selected" com.jetbrains.intellij "$((1000 + retained_kb))" "$encoded" '' false false false '' '' '' '' none x com.jetbrains.intellij '' x)
+IFS='|' detail="${fields[*]}"; unset IFS
+app_details=("$detail")
+_batch_selected_app_plan_matches() { return 0; }
+stop_launch_services() { :; }
+unregister_app_bundle() { :; }
+remove_login_item() { :; }
+force_kill_app() { :; }
+stop_inline_spinner() { :; }
+defaults() { printf 'defaults:%s\n' "$*" >> "$HOME/forbidden"; }
+bootout_login_item_helpers() { printf 'helpers\n' >> "$HOME/forbidden"; }
+mole_delete() {
+    if [[ "$1" == "$selected" ]]; then
+        mv "$selected" "$HOME/removed-fixture.app"
+        case "$SCENARIO" in
+            shared | single)
+                mkdir -p "$other/Contents"
+                printf '%s\n' '<plist><dict><key>CFBundleIdentifier</key><string>com.jetbrains.intellij.ce</string></dict></plist>' > "$other/Contents/Info.plist"
+                ;;
+            unknown)
+                ln -s "$HOME/Applications" "$HOME/unknown-root"
+                _MOLE_UNINSTALL_LIVE_APP_ROOTS=("$HOME/unknown-root")
+                ;;
+            reappeared) mkdir -p "$selected/Contents" ;;
+        esac
+        return 0
+    fi
+    printf 'sink:%s\n' "$1" >> "$HOME/forbidden"
+}
+success_count=0 failed_count=0 brew_apps_removed=0 total_size_freed=0 files_cleaned=0 total_items=0
+failed_items=() success_items=() success_dock_targets=() system_extension_warning_apps=()
+review_only_system_leftovers=() review_only_system_leftover_keys=() running_at_uninstall_apps=()
+_batch_execute_removals
+[[ $success_count -eq 1 && $failed_count -eq 0 ]] || exit 1
+[[ ! -e "$HOME/forbidden" ]] || { cat "$HOME/forbidden"; exit 1; }
+[[ -f "$support/state" ]] || exit 1
+printf 'FREED_KB=%s\n' "$total_size_freed"
+EOF
+        [ "$status" -eq 0 ] || { echo "$scenario: $output"; return 1; }
+        case "$scenario" in
+            shared) label='Kept (shared with another installed app): 3 paths' ;;
+            unknown) label='Kept (other copies of the app could not be checked): 3 paths' ;;
+            reappeared) label='Kept (selected app path exists again; select the app again): 3 paths' ;;
+            single) label='Kept (shared with another installed app): ~/Library/Application Support/IntelliJ' ;;
+        esac
+        [[ "$output" == *"$label"* ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$(printf '%s\n' "$output" | grep -cF 'Kept (')" -eq 1 ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$output" != *"protected by Mole"* && "$output" != *"Could not remove"* ]] || { echo "$scenario: $output"; return 1; }
+        [[ "$output" == *"FREED_KB=1000"* ]] || { echo "$scenario: $output"; return 1; }
+    done
 }

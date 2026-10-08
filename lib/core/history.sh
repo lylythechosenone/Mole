@@ -138,10 +138,21 @@ history_reset_active_session() {
 # Open sessions wait here, with fields separated by \x1f. Marker-less legacy
 # commands (installer) still end at the next marker, as before.
 declare -a HISTORY_PARKED_SESSIONS=()
+# Lookup aids for the parked list, so a log of runs that never wrote an end
+# marker is not rescanned for every new run: every parked identity as
+# \x1e<command>\x1f<run id>\x1f, and how many parked sessions are legacy and
+# unmarked (no run id, no start marker), the only kind
+# history_finish_unmarked_sessions can close.
+HISTORY_PARKED_KEYS=""
+HISTORY_PARKED_UNMARKED=0
 
 history_park_active_session() {
     [[ -n "$HISTORY_ACTIVE_COMMAND" ]] || return 0
     local sep=$'\x1f'
+    HISTORY_PARKED_KEYS+=$'\x1e'"${HISTORY_ACTIVE_COMMAND}${sep}${HISTORY_ACTIVE_RUN_ID}${sep}"
+    if [[ -z "$HISTORY_ACTIVE_RUN_ID" && "$HISTORY_ACTIVE_MARKED" != "1" ]]; then
+        HISTORY_PARKED_UNMARKED=$((HISTORY_PARKED_UNMARKED + 1))
+    fi
     HISTORY_PARKED_SESSIONS+=("${HISTORY_ACTIVE_COMMAND}${sep}${HISTORY_ACTIVE_RUN_ID}${sep}${HISTORY_ACTIVE_AMBIGUOUS}${sep}${HISTORY_ACTIVE_STARTED_AT}${sep}${HISTORY_ACTIVE_ENDED_AT}${sep}${HISTORY_ACTIVE_ITEMS}${sep}${HISTORY_ACTIVE_SIZE}${sep}${HISTORY_ACTIVE_REMOVED}${sep}${HISTORY_ACTIVE_TRASHED}${sep}${HISTORY_ACTIVE_SKIPPED}${sep}${HISTORY_ACTIVE_FAILED}${sep}${HISTORY_ACTIVE_REBUILT}${sep}${HISTORY_ACTIVE_OTHER}${sep}${HISTORY_ACTIVE_OPERATIONS}${sep}${HISTORY_ACTIVE_FAILED_TASKS}${sep}${HISTORY_ACTIVE_START_SEQ}${sep}${HISTORY_ACTIVE_MARKED}")
     history_reset_active_session
 }
@@ -154,25 +165,44 @@ history_activate_session() {
 
     history_park_active_session
 
-    local -a remaining=()
-    local record found=""
+    # A new identity usually matches nothing, so test the key list before
+    # walking or copying the sessions.
+    local key=$'\x1e'"${command}"$'\x1f'"${run_id}"$'\x1f'
+    [[ "$HISTORY_PARKED_KEYS" == *"$key"* ]] || return 1
+
+    local record found="" skip=0
     for record in "${HISTORY_PARKED_SESSIONS[@]+"${HISTORY_PARKED_SESSIONS[@]}"}"; do
-        if [[ -z "$found" && "$record" == "$command"$'\x1f'"$run_id"$'\x1f'* ]]; then
+        if [[ "$record" == "$command"$'\x1f'"$run_id"$'\x1f'* ]]; then
             found="$record"
-        else
-            remaining+=("$record")
+            break
         fi
+        skip=$((skip + 1))
     done
-    HISTORY_PARKED_SESSIONS=("${remaining[@]+"${remaining[@]}"}")
     [[ -n "$found" ]] || return 1
 
+    local -a remaining=()
+    local index=0
+    for record in "${HISTORY_PARKED_SESSIONS[@]}"; do
+        [[ "$index" -eq "$skip" ]] || remaining+=("$record")
+        index=$((index + 1))
+    done
+    HISTORY_PARKED_SESSIONS=("${remaining[@]+"${remaining[@]}"}")
+    HISTORY_PARKED_KEYS="${HISTORY_PARKED_KEYS/"$key"/}"
+
+    history_restore_parked_session "$found"
+    if [[ -z "$HISTORY_ACTIVE_RUN_ID" && "$HISTORY_ACTIVE_MARKED" != "1" ]]; then
+        HISTORY_PARKED_UNMARKED=$((HISTORY_PARKED_UNMARKED - 1))
+    fi
+    return 0
+}
+
+history_restore_parked_session() {
     IFS=$'\x1f' read -r HISTORY_ACTIVE_COMMAND HISTORY_ACTIVE_RUN_ID HISTORY_ACTIVE_AMBIGUOUS HISTORY_ACTIVE_STARTED_AT \
         HISTORY_ACTIVE_ENDED_AT HISTORY_ACTIVE_ITEMS HISTORY_ACTIVE_SIZE \
         HISTORY_ACTIVE_REMOVED HISTORY_ACTIVE_TRASHED HISTORY_ACTIVE_SKIPPED \
         HISTORY_ACTIVE_FAILED HISTORY_ACTIVE_REBUILT HISTORY_ACTIVE_OTHER \
         HISTORY_ACTIVE_OPERATIONS HISTORY_ACTIVE_FAILED_TASKS \
-        HISTORY_ACTIVE_START_SEQ HISTORY_ACTIVE_MARKED <<< "$found"
-    return 0
+        HISTORY_ACTIVE_START_SEQ HISTORY_ACTIVE_MARKED <<< "$1"
 }
 
 # Close sessions that no start marker opened, except the one of <command>.
@@ -182,6 +212,8 @@ history_finish_unmarked_sessions() {
         -z "$HISTORY_ACTIVE_RUN_ID" && "$HISTORY_ACTIVE_COMMAND" != "$keep_command" ]]; then
         history_finish_session
     fi
+    # Identified runs never qualify, so a log of them skips the parked scan.
+    [[ "$HISTORY_PARKED_UNMARKED" -gt 0 ]] || return 0
     local -a unmarked=()
     local record command run_id
     for record in "${HISTORY_PARKED_SESSIONS[@]+"${HISTORY_PARKED_SESSIONS[@]}"}"; do
@@ -203,10 +235,13 @@ history_finish_unmarked_sessions() {
 # wrote an end marker would be listed as the newest one.
 history_finish_all_sessions() {
     history_finish_session
-    while [[ ${#HISTORY_PARKED_SESSIONS[@]} -gt 0 ]]; do
-        local command run_id
-        IFS=$'\x1f' read -r command run_id _ <<< "${HISTORY_PARKED_SESSIONS[0]}"
-        history_activate_session "$command" "$run_id" || break
+    local -a parked=("${HISTORY_PARKED_SESSIONS[@]+"${HISTORY_PARKED_SESSIONS[@]}"}")
+    HISTORY_PARKED_SESSIONS=()
+    HISTORY_PARKED_KEYS=""
+    HISTORY_PARKED_UNMARKED=0
+    local parked_record
+    for parked_record in "${parked[@]+"${parked[@]}"}"; do
+        history_restore_parked_session "$parked_record"
         history_finish_session
     done
 
@@ -447,6 +482,8 @@ history_parse_operation_line() {
 history_reset_sessions() {
     history_reset_active_session
     HISTORY_PARKED_SESSIONS=()
+    HISTORY_PARKED_KEYS=""
+    HISTORY_PARKED_UNMARKED=0
     HISTORY_SESSION_COMMANDS=()
     HISTORY_SESSION_RUN_IDS=()
     HISTORY_SESSION_AMBIGUOUS=()
@@ -619,6 +656,8 @@ history_render_text() {
     session_count=${#HISTORY_SESSION_COMMANDS[@]}
     deletion_count=${#HISTORY_DELETE_TIMESTAMPS[@]}
 
+    # Logs from V1.58.0 and earlier can still hold raw control bytes. Every
+    # field read from them is printed escaped; --json keeps the stored value.
     printf '\n%sMole History%s\n\n' "$BLUE" "$NC"
 
     if [[ "$session_count" -eq 0 ]]; then
@@ -643,6 +682,10 @@ history_render_text() {
             local other="${HISTORY_SESSION_OTHER[$idx]}"
             local failed_tasks="${HISTORY_SESSION_FAILED_TASKS[$idx]}"
             local count_text
+            _mole_escape_log_value command "$command"
+            _mole_escape_log_value started "$started"
+            _mole_escape_log_value ended "$ended"
+            _mole_escape_log_value size "$size"
             count_text=$(history_join_counts "$removed" "$trashed" "$skipped" "$failed" "$rebuilt" "$other")
             if [[ "$failed_tasks" -gt 0 ]]; then
                 count_text+=", $failed_tasks optimize tasks failed"
@@ -671,6 +714,10 @@ history_render_text() {
             local status="${HISTORY_DELETE_STATUSES[$idx]}"
             local path="${HISTORY_DELETE_PATHS[$idx]}"
             local size_label
+            _mole_escape_log_value timestamp "$timestamp"
+            _mole_escape_log_value mode "$mode"
+            _mole_escape_log_value status "$status"
+            _mole_escape_log_value path "$path"
             size_label=$(history_size_label "$size_kb")
             printf '  %-24s %-9s %-16s %8s  %s\n' "$timestamp" "$mode" "$status" "$size_label" "$path"
             idx=$((idx - 1))

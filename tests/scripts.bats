@@ -199,6 +199,65 @@ BATS
     [[ "$(grep -c "bare '! cmd'" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
 }
 
+@test "bats assertion audit catches bare brackets and arithmetic in test and heredoc bodies" {
+    local audit="$PROJECT_ROOT/scripts/audit_bats_assertions.py"
+    local live_fixture="$BATS_TEST_TMPDIR/bracket-live.bats"
+    local vacuous_fixture="$BATS_TEST_TMPDIR/bracket-vacuous.bats"
+    # Bats would read a literal test header here as a test of this file.
+    sed 's/^TEST /@test /' > "$live_fixture" <<'BATS'
+TEST "assertions that can still fail" {
+    [[ -f "$trace" ]] || return 1
+    (( count++ ))
+    (( bits <<= 1 ))
+    (( bits >>= 1 ))
+    (( elapsed < 5 )) || return 1
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+stub() {
+    [[ -f "$mock" ]]
+    :
+}
+(( n += 1 ))
+[[ -f "$trace" ]] || exit 1
+(( total > 3 )) || exit 1
+[[ -f "$last" ]]
+EOF
+    cat > "$HOME/data" <<'EOF'
+[[ -f "$data" ]]
+:
+EOF
+    (( elapsed < 5 ))
+}
+BATS
+    sed 's/^TEST /@test /' > "$vacuous_fixture" <<'BATS'
+TEST "assertions that never fail" {
+    [[ -f "$trace" ]]
+    (( elapsed < 5 ))
+    run env HOME="$HOME" /bin/bash --noprofile --norc <<'EOF'
+set -euo pipefail
+[[ -f "$trace" ]]
+(( total > 3 ))
+:
+EOF
+    [ "$status" -eq 0 ]
+}
+BATS
+
+    # Positive control: the guarded forms, a mock body, a data heredoc and a
+    # computation without a comparison are all accepted.
+    run python3 "$audit" "$live_fixture"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"bats-assertion-audit-ok"* ]] || return 1
+
+    run python3 "$audit" "$vacuous_fixture"
+    [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+    local line
+    for line in 2 3 6 7; do
+        [[ "$output" == *"$vacuous_fixture:$line:"* ]] || { echo "line $line not flagged"; echo "$output"; return 1; }
+    done
+    [[ "$(grep -c "bare \[\[ \]\]" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
+    [[ "$(grep -c "bare (( ))" <<< "$output")" -eq 2 ]] || { echo "$output"; return 1; }
+}
+
 @test "Makefile has build target for Go binaries" {
     run /bin/bash -c "grep -Eq '(^|[[:space:]])(go|\\$\\(GO\\))[[:space:]]+build' '$PROJECT_ROOT/Makefile'"
     [ "$status" -eq 0 ]

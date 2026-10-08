@@ -110,6 +110,16 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the same `PATH` export to `~/.zshrc` or your shell profile for new terminals. Mole updates the installation you invoked, so it keeps using this directory. Commands that change system-owned files may still request administrator access.
 
+On macOS, Nix users can install the flake from `main`, which contains unreleased changes:
+
+```bash
+nix profile install github:tw93/mole/main#mole
+nix profile upgrade mole
+nix profile remove mole
+```
+
+For a declarative installation, add `github:tw93/mole/main` as a flake input and use its `packages.${system}.mole` package. Update or remove Mole through Nix; `mo update` and `mo remove` leave Nix-managed installations unchanged.
+
 </details>
 
 Prefer a walkthrough? Watch the [Mole tutorial video](https://www.youtube.com/watch?v=UEe9-w4CcQ0) by PAPAYA 電腦教室.
