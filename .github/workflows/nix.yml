@@ -26,17 +26,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-      - name: Resolve Intel-compatible nixpkgs lock
-        run: |
-          nix flake update nixpkgs
-          echo 'BEGIN_GENERATED_FLAKE_LOCK'
-          cat flake.lock
-          echo 'END_GENERATED_FLAKE_LOCK'
-      - name: Save generated lock
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lock-${{ matrix.runner }}
-          path: flake.lock
       - name: Build package
         run: nix build --no-write-lock-file --print-build-logs .#mole
       - name: Check installed package
