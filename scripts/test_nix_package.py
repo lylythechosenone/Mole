@@ -23,8 +23,14 @@ def check_menu(launcher, env):
         os.setsid()
         fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
+    # Keep the controlling terminal alive while Bash restores it on exit.
+    keeper = (
+        "import subprocess,time; "
+        f"p=subprocess.run([{str(launcher)!r}]); "
+        "print('MENU_EXIT='+str(p.returncode),flush=True); time.sleep(10)"
+    )
     process = subprocess.Popen(
-        [str(launcher)], stdin=slave, stdout=slave, stderr=slave,
+        [sys.executable, "-c", keeper], stdin=slave, stdout=slave, stderr=slave,
         env=env, preexec_fn=own_terminal,
     )
     output = b""
@@ -45,7 +51,12 @@ def check_menu(launcher, env):
             if select.select([master], [], [], 0.05)[0]:
                 output += os.read(master, 65536)
         os.write(master, b"q")
-        assert process.wait(timeout=5) == 0, output
+        deadline = time.monotonic() + 5
+        while b"MENU_EXIT=" not in output:
+            assert time.monotonic() < deadline, ("menu failed to exit", output)
+            if select.select([master], [], [], 0.05)[0]:
+                output += os.read(master, 65536)
+        assert b"MENU_EXIT=0" in output, output
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
